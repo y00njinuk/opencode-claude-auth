@@ -1,6 +1,10 @@
-# Install opencode-claude-auth
+# Install @y00njinuk/opencode-claude-auth
 
 These instructions are designed for AI coding agents.
+
+This is a fork of the upstream `opencode-claude-auth` package. If the config
+already lists the upstream package, **replace** it rather than adding this one
+alongside — running both installs two plugins that refresh the same credentials.
 
 ## Prerequisites
 
@@ -46,11 +50,11 @@ This will prompt you to log in and store credentials in Keychain (macOS) or `~/.
 
 Edit the OpenCode configuration file at `~/.config/opencode/opencode.json`.
 
-Add `opencode-claude-auth@latest` to the `plugin` array:
+Add `@y00njinuk/opencode-claude-auth@latest` to the `plugin` array:
 
 ```json
 {
-  "plugin": ["opencode-claude-auth@latest"]
+  "plugin": ["@y00njinuk/opencode-claude-auth@latest"]
 }
 ```
 
@@ -60,10 +64,11 @@ Or run this command to do it automatically:
 node -e "
 const fs = require('fs'), p = require('path').join(require('os').homedir(), '.config/opencode/opencode.json');
 const c = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p,'utf8')) : {};
-c.plugin = [...new Set([...(Array.isArray(c.plugin) ? c.plugin : []), 'opencode-claude-auth@latest'])];
+const keep = (Array.isArray(c.plugin) ? c.plugin : []).filter(x => !/(^|\/)opencode-claude-auth(@|$)/.test(x));
+c.plugin = [...new Set([...keep, '@y00njinuk/opencode-claude-auth@latest'])];
 fs.mkdirSync(require('path').dirname(p), {recursive:true});
 fs.writeFileSync(p, JSON.stringify(c, null, 2));
-console.log('Added opencode-claude-auth@latest to', p);
+console.log('Added @y00njinuk/opencode-claude-auth@latest to', p);
 "
 ```
 
@@ -77,16 +82,16 @@ Verify the plugin was added:
 cat ~/.config/opencode/opencode.json
 ```
 
-You should see `opencode-claude-auth@latest` in the `plugin` array.
+You should see `@y00njinuk/opencode-claude-auth@latest` in the `plugin` array.
 
 ## Upgrading
 
-If you previously installed `opencode-claude-auth` without the `@latest` tag, update your config to use `opencode-claude-auth@latest` as shown above.
+If you previously installed the upstream `opencode-claude-auth` (with or without an `@latest` tag), remove that entry from the `plugin` array and use `@y00njinuk/opencode-claude-auth@latest` instead. The command above does this for you.
 
 If the plugin isn't picking up a new version, clear the cached package and restart OpenCode:
 
 ```bash
-rm -rf ~/.cache/opencode/packages/opencode-claude-auth@latest/
+rm -rf ~/.cache/opencode/packages/@y00njinuk/opencode-claude-auth@latest/
 ```
 
 ## Done

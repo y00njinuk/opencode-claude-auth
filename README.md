@@ -1,10 +1,15 @@
-# opencode-claude-auth
+# @y00njinuk/opencode-claude-auth
 
-[![npm](https://img.shields.io/npm/v/opencode-claude-auth)](https://www.npmjs.com/package/opencode-claude-auth)
-[![CI](https://github.com/griffinmartin/opencode-claude-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/griffinmartin/opencode-claude-auth/actions/workflows/ci.yml)
-[![Socket Badge](https://socket.dev/api/badge/npm/package/opencode-claude-auth)](https://socket.dev/npm/package/opencode-claude-auth)
+[![npm](https://img.shields.io/npm/v/@y00njinuk/opencode-claude-auth)](https://www.npmjs.com/package/@y00njinuk/opencode-claude-auth)
+[![CI](https://github.com/y00njinuk/opencode-claude-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/y00njinuk/opencode-claude-auth/actions/workflows/ci.yml)
 
 Self-contained Anthropic auth provider for OpenCode using your Claude Code credentials — no separate login or API key needed.
+
+> **This is a fork** of [griffinmartin/opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth), published to npm as `@y00njinuk/opencode-claude-auth` and maintained independently. Changes in this fork are not sent upstream, so version numbers here do not line up with the original package. Install one or the other, never both — two copies of the plugin would each run their own refresh timer against the same credentials.
+>
+> Fork-only additions:
+>
+> - [`OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS`](#environment-variable-overrides) — tunes (or disables) the background proactive refresh introduced upstream in 2.1.4.
 
 ## How it works
 
@@ -28,7 +33,7 @@ macOS is preferred (uses Keychain). Linux and Windows work via the credentials f
 Paste this into any LLM agent (Claude Code, OpenCode, Cursor, etc.):
 
 ```
-Install the opencode-claude-auth plugin and configure it by following: https://raw.githubusercontent.com/griffinmartin/opencode-claude-auth/main/installation.md
+Install the @y00njinuk/opencode-claude-auth plugin and configure it by following: https://raw.githubusercontent.com/y00njinuk/opencode-claude-auth/main/installation.md
 ```
 
 **Option B: Manual setup**
@@ -37,7 +42,7 @@ Install the opencode-claude-auth plugin and configure it by following: https://r
 
    ```json
    {
-     "plugin": ["opencode-claude-auth@latest"]
+     "plugin": ["@y00njinuk/opencode-claude-auth@latest"]
    }
    ```
 
@@ -106,7 +111,7 @@ If only one account is found, the switcher is hidden and the plugin uses it dire
 | Keychain read timed out                             | Restart Keychain Access (can happen on macOS Tahoe)                                                                                       |
 | "Credentials are unavailable or expired"            | Run `claude` to refresh your Claude Code credentials                                                                                      |
 | "Extra usage is required for long context requests" | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                   |
-| Plugin not updating to latest version               | Delete the cached package: `rm -rf ~/.cache/opencode/packages/opencode-claude-auth@latest/` then restart OpenCode                         |
+| Plugin not updating to latest version               | Delete the cached package: `rm -rf ~/.cache/opencode/packages/@y00njinuk/opencode-claude-auth@latest/` then restart OpenCode              |
 
 ### Diagnostic logging
 

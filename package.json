@@ -1,7 +1,7 @@
 {
-  "name": "opencode-claude-auth",
+  "name": "@y00njinuk/opencode-claude-auth",
   "version": "2.1.6",
-  "description": "OpenCode plugin that uses your Claude Code credentials — no separate login needed.",
+  "description": "OpenCode plugin that uses your Claude Code credentials — no separate login needed. Fork of opencode-claude-auth with a configurable proactive refresh window.",
   "keywords": [
     "anthropic",
     "auth",
@@ -12,7 +12,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/griffinmartin/opencode-claude-auth.git"
+    "url": "git+https://github.com/y00njinuk/opencode-claude-auth.git"
   },
   "files": [
     "opencode-claude-auth.js",
@@ -48,6 +48,9 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "rm -rf dist && tsc && cp src/anthropic-prompt.txt dist/",
