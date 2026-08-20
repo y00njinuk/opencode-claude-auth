@@ -19,6 +19,7 @@ import {
 } from "./transforms.ts"
 import {
   getCachedCredentials,
+  getCredentialsForSync,
   getCredentialsWithBackoff,
   getActiveRefreshFailureKind,
   reloadCredentialsFromSource,
@@ -169,7 +170,23 @@ export function buildRequestHeaders(
 }
 
 const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
-const PROACTIVE_REFRESH_THRESHOLD_MS = 60 * 60 * 1000 // 1 hour before expiry
+
+const DEFAULT_PROACTIVE_REFRESH_THRESHOLD_MS = 60 * 60 * 1000 // 1 hour before expiry
+
+/**
+ * How far ahead of expiry the background sync timer refreshes the token.
+ * `0` disables proactive refresh entirely: the timer then only syncs
+ * auth.json from already-valid cached credentials, which is the pre-2.1.4
+ * behaviour for anyone who would rather let the reactive (60s) path do all
+ * the refreshing. Invalid or negative values fall back to the default.
+ */
+const PROACTIVE_REFRESH_THRESHOLD_MS = (() => {
+  const raw = process.env.OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN
+  return Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : DEFAULT_PROACTIVE_REFRESH_THRESHOLD_MS
+})()
 
 const plugin: Plugin = async () => {
   initLogger()
@@ -218,14 +235,24 @@ const plugin: Plugin = async () => {
     // refreshIfNeeded() always resolves the currently ACTIVE account
     // (via getActiveAccount() internally) — not a closure-captured account
     // list — so this stays correct across account switches. Passing
-    // PROACTIVE_REFRESH_THRESHOLD_MS (1 hour) means it triggers a real
-    // OAuth refresh once the token is within that window of expiry, and
-    // simply returns the untouched credentials otherwise (no-op refresh).
-    // This prevents the "run `claude` to re-authenticate" message from
-    // appearing mid-session when the token silently expires.
+    // PROACTIVE_REFRESH_THRESHOLD_MS (1 hour by default) means it triggers
+    // a real OAuth refresh once the token is within that window of expiry,
+    // and simply returns the untouched credentials otherwise (no-op
+    // refresh). This prevents the "run `claude` to re-authenticate" message
+    // from appearing mid-session when the token silently expires.
+    // OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS tunes that window, or
+    // disables the refresh half of this timer entirely when set to 0.
     let proactiveRefreshWarned = false
     const syncTimer = setInterval(async () => {
       try {
+        // Proactive refresh disabled: sync auth.json from cached
+        // credentials only, never initiate an OAuth refresh from the timer.
+        if (PROACTIVE_REFRESH_THRESHOLD_MS === 0) {
+          const cached = getCredentialsForSync()
+          if (cached) syncAuthJson(cached)
+          return
+        }
+
         const account = getActiveAccount()
         log("proactive_refresh_check", {
           source: account?.source ?? null,
