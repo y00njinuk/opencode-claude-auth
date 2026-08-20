@@ -318,6 +318,69 @@ export const PRIMARY_SERVICE = "Claude Code-credentials"
   return { helpersModule }
 }
 
+function restoreEnv(key: string, previous: string | undefined): void {
+  if (previous === undefined) {
+    delete process.env[key]
+  } else {
+    process.env[key] = previous
+  }
+}
+
+const PROACTIVE_ENV = "OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS"
+
+/**
+ * Boot the plugin against the two-account fake keychain with
+ * OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS set to `envValue`, fire exactly
+ * one background sync tick, and return only the debug log that tick wrote.
+ * index.ts reads the env var once at module scope, so it has to be in place
+ * before the import — which resolves to a freshly copied (hence uncached)
+ * module per call, so each case gets its own evaluation of the threshold.
+ */
+async function captureProactiveTickLog(
+  envValue: string | undefined,
+): Promise<string> {
+  const originalSetInterval = globalThis.setInterval
+  const originalHome = process.env.HOME
+  const originalDebug = process.env.CLAUDE_AUTH_DEBUG
+  const originalProactive = process.env[PROACTIVE_ENV]
+  const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+  const debugLogPath = join(tempHome, "debug.log")
+  process.env.HOME = tempHome
+  process.env.CLAUDE_AUTH_DEBUG = debugLogPath
+  restoreEnv(PROACTIVE_ENV, envValue)
+
+  let tickCallback: (() => void | Promise<void>) | undefined
+  globalThis.setInterval = ((cb: () => void | Promise<void>) => {
+    tickCallback = cb
+    return { unref() {} }
+  }) as unknown as typeof setInterval
+
+  try {
+    const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
+      // Both accounts far from expiry, so refreshIfNeeded short-circuits on
+      // the still-valid token: the tick exercises threshold resolution only,
+      // with no refresh attempt and no CLI fallback to slow it down.
+      aExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
+      bExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
+      bRefreshResult: "success",
+    })
+
+    await helpersModule.default({} as never)
+    assert.ok(tickCallback, "Expected setInterval to capture the tick callback")
+
+    // Truncate so only entries produced by the tick are inspected.
+    await writeFile(debugLogPath, "", "utf-8")
+    await tickCallback!()
+
+    return await readFile(debugLogPath, "utf-8")
+  } finally {
+    globalThis.setInterval = originalSetInterval
+    restoreEnv("HOME", originalHome)
+    restoreEnv("CLAUDE_AUTH_DEBUG", originalDebug)
+    restoreEnv(PROACTIVE_ENV, originalProactive)
+  }
+}
+
 function makeCreds(overrides?: Partial<ClaudeCredentials>): ClaudeCredentials {
   return {
     accessToken: "sk-ant-test-access",
@@ -1066,6 +1129,91 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       } else {
         delete process.env.HOME
       }
+    }
+  })
+
+  it("proactive refresh window is overridable via OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS", async () => {
+    const logs = await captureProactiveTickLog("120000")
+    const entries = logs
+      .split("\n")
+      .filter((line) => line.includes("proactive_refresh_check"))
+    assert.ok(
+      entries.length > 0,
+      `Expected proactive_refresh_check log entry, got log: ${logs}`,
+    )
+    assert.ok(
+      entries.every((line) => line.includes('"thresholdMs":120000')),
+      `Timer should refresh against the env-provided window. Log: ${logs}`,
+    )
+  })
+
+  it("proactive refresh window falls back to 1h on unparseable or negative env values", async () => {
+    for (const raw of ["abc", "-1", ""]) {
+      const logs = await captureProactiveTickLog(raw)
+      assert.ok(
+        logs.includes('"thresholdMs":3600000'),
+        `Expected the 1h default for env value ${JSON.stringify(raw)}. ` +
+          `Log: ${logs}`,
+      )
+    }
+  })
+
+  it("OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS=0 stops the timer refreshing but keeps auth.json synced", async () => {
+    const logs = await captureProactiveTickLog("0")
+    assert.ok(
+      !logs.includes("proactive_refresh_check"),
+      `Timer must not enter the refresh path when disabled. Log: ${logs}`,
+    )
+    assert.ok(
+      !logs.includes("refresh_needed"),
+      `Timer must not initiate an OAuth refresh when disabled. Log: ${logs}`,
+    )
+    assert.ok(
+      logs.includes("sync_auth_json"),
+      `auth.json must still be synced when the refresh half is disabled. ` +
+        `Log: ${logs}`,
+    )
+  })
+
+  it("disabling proactive refresh leaves the reactive 60s refresh untouched", async () => {
+    const originalSetInterval = globalThis.setInterval
+    const originalHome = process.env.HOME
+    const originalDebug = process.env.CLAUDE_AUTH_DEBUG
+    const originalProactive = process.env[PROACTIVE_ENV]
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    const debugLogPath = join(tempHome, "debug.log")
+    process.env.HOME = tempHome
+    process.env.CLAUDE_AUTH_DEBUG = debugLogPath
+    process.env[PROACTIVE_ENV] = "0"
+    globalThis.setInterval = (() => ({
+      unref() {},
+    })) as unknown as typeof setInterval
+
+    try {
+      const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
+        // Active account (accounts[0]) sits inside the reactive 60s window,
+        // which the timer never looks at — only getCachedCredentials() does.
+        aExpiresAt: Date.now() + 30_000,
+        // Kept refreshable so the fallback yields usable creds and init does
+        // not print the "run `claude`" warning over the test output.
+        bExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
+        bRefreshResult: "success",
+      })
+
+      // Plugin init resolves credentials through the reactive path.
+      await helpersModule.default({} as never)
+
+      const logs = await readFile(debugLogPath, "utf-8")
+      assert.ok(
+        logs.includes("refresh_needed"),
+        `Reactive refresh must still fire for a token 30s from expiry with ` +
+          `proactive refresh disabled. Log: ${logs}`,
+      )
+    } finally {
+      globalThis.setInterval = originalSetInterval
+      restoreEnv("HOME", originalHome)
+      restoreEnv("CLAUDE_AUTH_DEBUG", originalDebug)
+      restoreEnv(PROACTIVE_ENV, originalProactive)
     }
   })
 
