@@ -1,5 +1,21 @@
 # Changelog
 
+Releases from 2.2.0 onward are this fork (`@y00njinuk/opencode-claude-auth`).
+Earlier entries are inherited from upstream `opencode-claude-auth` and their
+links point at the upstream repository.
+
+## [2.2.0](https://github.com/y00njinuk/opencode-claude-auth/compare/v2.1.6...v2.2.0) (2026-08-20)
+
+
+### Features
+
+* make the proactive refresh window configurable via `OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS` ([4b5e3d7](https://github.com/y00njinuk/opencode-claude-auth/commit/4b5e3d7))
+
+
+### Miscellaneous
+
+* publish this fork as `@y00njinuk/opencode-claude-auth` ([1ef4f1e](https://github.com/y00njinuk/opencode-claude-auth/commit/1ef4f1e))
+
 ## [2.1.6](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.1.5...v2.1.6) (2026-08-03)
 
 
