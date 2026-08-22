@@ -9,6 +9,8 @@ import {
   isRefreshCooldownActive,
   getRefreshCooldownUntil,
   getRefreshFailureKind,
+  getRefreshFailureDetail,
+  describeRefreshFailure,
   resetRefreshBackoffState,
   BASE_COOLDOWN_MS,
   MAX_COOLDOWN_MS,
@@ -18,6 +20,60 @@ const SRC = "Claude Code-credentials"
 
 describe("refresh-backoff", () => {
   beforeEach(() => resetRefreshBackoffState())
+
+  describe("describeRefreshFailure", () => {
+    // Every non-terminal outcome is classified transient, so the request
+    // path used to blame a rate limit for a DNS failure, a proxy block, or a
+    // timeout alike. Each mode must now name itself.
+    it("names a real rate limit", () => {
+      noteRefreshTransient(SRC, { status: 429, oauthError: "rate_limit_error" })
+      assert.match(
+        describeRefreshFailure(getRefreshFailureDetail(SRC)),
+        /rate-limited/,
+      )
+    })
+
+    it("names an unreachable endpoint rather than calling it a rate limit", () => {
+      // status 0 is what a DNS failure, TLS error, connection reset, or the
+      // 15s abort produces — no HTTP response was ever received.
+      noteRefreshTransient(SRC, { status: 0 })
+      const msg = describeRefreshFailure(getRefreshFailureDetail(SRC))
+      assert.match(msg, /unreachable/)
+      assert.doesNotMatch(
+        msg,
+        /rate-limited/,
+        `A network failure must not be reported as a rate limit. Got: ${msg}`,
+      )
+    })
+
+    it("names a server error by status", () => {
+      noteRefreshTransient(SRC, { status: 503 })
+      const msg = describeRefreshFailure(getRefreshFailureDetail(SRC))
+      assert.match(msg, /503/)
+      assert.doesNotMatch(msg, /rate-limited/)
+    })
+
+    it("names an unexpected 4xx with its oauth error", () => {
+      noteRefreshTransient(SRC, { status: 403, oauthError: "access_denied" })
+      const msg = describeRefreshFailure(getRefreshFailureDetail(SRC))
+      assert.match(msg, /403/)
+      assert.match(msg, /access_denied/)
+      assert.doesNotMatch(msg, /rate-limited/)
+    })
+
+    it("names a rejected refresh token on the terminal path", () => {
+      noteRefreshTerminal(SRC, { status: 400, oauthError: "invalid_grant" })
+      const msg = describeRefreshFailure(getRefreshFailureDetail(SRC))
+      assert.match(msg, /invalid_grant/)
+      assert.doesNotMatch(msg, /rate-limited/)
+    })
+
+    it("clears the detail after a successful refresh", () => {
+      noteRefreshTransient(SRC, { status: 429 })
+      clearRefreshOutcome(SRC)
+      assert.equal(getRefreshFailureDetail(SRC), null)
+    })
+  })
 
   describe("classifyRefreshFailure", () => {
     it("treats rate limiting as transient", () => {

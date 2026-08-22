@@ -23,10 +23,12 @@ import {
   classifyRefreshFailure,
   clearRefreshOutcome,
   getRefreshCooldownUntil,
+  getRefreshFailureDetail,
   getRefreshFailureKind,
   isRefreshCooldownActive,
   noteRefreshTerminal,
   noteRefreshTransient,
+  type RefreshFailureDetail,
   type RefreshFailureKind,
 } from "./refresh-backoff.ts"
 import { acquireRefreshLock } from "./refresh-lock.ts"
@@ -698,6 +700,8 @@ async function performRefresh(
       // rate-limited endpoint and only deepens the limit.
       const cooldownMs = noteRefreshTransient(target.source, {
         retryAfterMs: outcome.retryAfterMs,
+        status: outcome.status,
+        oauthError: outcome.oauthError,
       })
       log("refresh_transient", {
         source: target.source,
@@ -723,7 +727,10 @@ async function performRefresh(
     if (outcome.kind === "terminal") {
       // The refresh token itself is dead (invalid_grant, ...). Fall through to
       // the CLI fallback / borrowed-account recovery below.
-      noteRefreshTerminal(target.source)
+      noteRefreshTerminal(target.source, {
+        status: outcome.status,
+        oauthError: outcome.oauthError,
+      })
       log("refresh_terminal", {
         source: target.source,
         status: outcome.status,
@@ -1151,6 +1158,15 @@ export async function getCredentialsWithBackoff(
  * deciding between a retryable response and a hard "re-authenticate" error.
  * An active cooldown implies a transient failure.
  */
+/**
+ * Why the active account's last refresh failed, so the request path can name
+ * the real cause instead of blaming a rate limit for every failure mode.
+ */
+export function getActiveRefreshFailureDetail(): RefreshFailureDetail | null {
+  const account = getActiveAccount()
+  return account ? getRefreshFailureDetail(account.source) : null
+}
+
 export function getActiveRefreshFailureKind(): RefreshFailureKind | null {
   const source = getActiveAccount()?.source
   if (!source) return null

@@ -50,6 +50,10 @@ interface BackoffOptions {
   retryAfterMs?: number
   now?: number
   rng?: () => number
+  /** HTTP status from the token endpoint; 0 when the request never got one. */
+  status?: number
+  /** OAuth error code from the endpoint's body, when it sent one. */
+  oauthError?: string
 }
 
 /**
@@ -83,6 +87,44 @@ interface CooldownState {
 
 const cooldowns = new Map<string, CooldownState>()
 const lastFailureKind = new Map<string, RefreshFailureKind>()
+const lastFailureDetail = new Map<string, RefreshFailureDetail>()
+
+/**
+ * Why the last refresh for an account failed, kept so the request path can
+ * tell the user what actually went wrong. `status` is the HTTP status from
+ * the token endpoint, or `0` when the request never produced one (DNS
+ * failure, TLS error, proxy block, connection reset, or the 15s timeout
+ * aborting it).
+ */
+export interface RefreshFailureDetail {
+  kind: RefreshFailureKind
+  status: number
+  oauthError?: string
+}
+
+/**
+ * One human-readable clause naming the actual failure, for the message the
+ * request path surfaces. Everything non-terminal used to be reported as
+ * "rate-limited", which sent people looking for a quota problem when the
+ * token endpoint was simply unreachable.
+ */
+export function describeRefreshFailure(
+  detail: RefreshFailureDetail | null,
+): string {
+  if (!detail) return "Claude token refresh failed"
+  if (detail.kind === "terminal") {
+    return `Claude refresh token was rejected (${detail.oauthError ?? `HTTP ${detail.status}`})`
+  }
+  if (detail.status === 429) return "Claude token refresh is rate-limited"
+  if (detail.status === 0) {
+    return "Claude token endpoint unreachable (network error or timeout)"
+  }
+  if (detail.status >= 500) {
+    return `Claude token endpoint returned HTTP ${detail.status}`
+  }
+  const why = detail.oauthError ? `, ${detail.oauthError}` : ""
+  return `Claude token refresh failed (HTTP ${detail.status}${why})`
+}
 
 /**
  * Record a transient refresh failure for `source` and return the cooldown
@@ -98,19 +140,33 @@ export function noteRefreshTransient(
   const ms = computeBackoffMs(consecutive, opts)
   cooldowns.set(source, { until: now + ms, consecutive })
   lastFailureKind.set(source, "transient")
+  lastFailureDetail.set(source, {
+    kind: "transient",
+    status: opts.status ?? 0,
+    oauthError: opts.oauthError,
+  })
   return ms
 }
 
 /** Record a terminal refresh failure (dead refresh token). No cooldown. */
-export function noteRefreshTerminal(source: string): void {
+export function noteRefreshTerminal(
+  source: string,
+  detail: { status?: number; oauthError?: string } = {},
+): void {
   cooldowns.delete(source)
   lastFailureKind.set(source, "terminal")
+  lastFailureDetail.set(source, {
+    kind: "terminal",
+    status: detail.status ?? 0,
+    oauthError: detail.oauthError,
+  })
 }
 
 /** Clear all backoff state for `source` after a successful refresh/adopt. */
 export function clearRefreshOutcome(source: string): void {
   cooldowns.delete(source)
   lastFailureKind.delete(source)
+  lastFailureDetail.delete(source)
 }
 
 export function isRefreshCooldownActive(
@@ -131,8 +187,15 @@ export function getRefreshFailureKind(
   return lastFailureKind.get(source) ?? null
 }
 
+export function getRefreshFailureDetail(
+  source: string,
+): RefreshFailureDetail | null {
+  return lastFailureDetail.get(source) ?? null
+}
+
 /** Test seam: drop all in-memory backoff state. */
 export function resetRefreshBackoffState(): void {
   cooldowns.clear()
   lastFailureKind.clear()
+  lastFailureDetail.clear()
 }
