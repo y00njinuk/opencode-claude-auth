@@ -1,6 +1,6 @@
 {
   "name": "@y00njinuk/opencode-claude-auth",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "OpenCode plugin that uses your Claude Code credentials — no separate login needed. Fork of opencode-claude-auth with a configurable proactive refresh window.",
   "keywords": [
     "anthropic",
