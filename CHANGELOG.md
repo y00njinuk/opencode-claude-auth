@@ -4,32 +4,6 @@ Releases from 2.2.0 onward are this fork (`@y00njinuk/opencode-claude-auth`).
 Earlier entries are inherited from upstream `opencode-claude-auth` and their
 links point at the upstream repository.
 
-## [2.2.2](https://github.com/y00njinuk/opencode-claude-auth/compare/v2.2.1...v2.2.2) (2026-08-22)
-
-
-### Bug Fixes
-
-* report the actual refresh failure instead of blaming a rate limit ([6274869](https://github.com/y00njinuk/opencode-claude-auth/commit/6274869))
-
-
-Every refresh failure that is not a dead refresh token was reported as
-`Claude token refresh is rate-limited; retry shortly.` — including DNS
-failures, TLS errors, proxy blocks, connection resets, 5xx responses,
-unexpected 4xx responses, and the 15s request timeout. The message now names
-what actually happened:
-
-| failure | message |
-| --- | --- |
-| network / timeout | `Claude token endpoint unreachable (network error or timeout)` |
-| 429 | `Claude token refresh is rate-limited` |
-| 5xx | `Claude token endpoint returned HTTP 502` |
-| other 4xx | `Claude token refresh failed (HTTP 403, access_denied)` |
-| dead refresh token | `Claude refresh token was rejected (invalid_grant)` |
-
-The status and OAuth error code are also written to the debug log, so a
-failure can be identified without reproducing it under `CLAUDE_AUTH_DEBUG`.
-Control flow is unchanged: the same failures stay retryable.
-
 ## [2.2.1](https://github.com/y00njinuk/opencode-claude-auth/compare/v2.2.0...v2.2.1) (2026-08-22)
 
 

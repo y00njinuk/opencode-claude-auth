@@ -4,7 +4,6 @@ import { config } from "./model-config.ts"
 import { readAllClaudeAccounts, type ClaudeAccount } from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
 import { fetchWithRetry } from "./http.ts"
-import { describeRefreshFailure } from "./refresh-backoff.ts"
 import {
   addExcludedBeta,
   getExcludedBetas,
@@ -22,7 +21,6 @@ import {
   getCachedCredentials,
   getCredentialsForSync,
   getCredentialsWithBackoff,
-  getActiveRefreshFailureDetail,
   getActiveRefreshFailureKind,
   reloadCredentialsFromSource,
   forceRefreshActiveAccount,
@@ -382,27 +380,17 @@ const plugin: Plugin = async () => {
               if (getActiveRefreshFailureKind() === "transient") {
                 // Retryable: let OpenCode/the AI SDK back off and retry rather
                 // than telling the user to re-authenticate for a passing
-                // failure that the refresh token would otherwise survive.
-                //
-                // Name the actual cause. Every non-terminal failure is
-                // classified transient — a 429, but equally a DNS failure, a
-                // TLS error, a proxy block, a connection reset, or the 15s
-                // timeout aborting the request. Reporting all of them as
-                // "rate-limited" sent people hunting for a quota problem when
-                // the token endpoint was simply unreachable from where
-                // OpenCode runs.
-                const detail = getActiveRefreshFailureDetail()
+                // rate-limit that the refresh token would otherwise survive.
                 log("fetch_credentials_transient_exhausted", {
                   modelId: "unknown",
-                  status: detail?.status ?? null,
-                  oauthError: detail?.oauthError ?? null,
                 })
                 return new Response(
                   JSON.stringify({
                     type: "error",
                     error: {
                       type: "overloaded_error",
-                      message: `${describeRefreshFailure(detail)}; retry shortly.`,
+                      message:
+                        "Claude token refresh is rate-limited; retry shortly.",
                     },
                   }),
                   {
