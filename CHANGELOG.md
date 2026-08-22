@@ -4,6 +4,32 @@ Releases from 2.2.0 onward are this fork (`@y00njinuk/opencode-claude-auth`).
 Earlier entries are inherited from upstream `opencode-claude-auth` and their
 links point at the upstream repository.
 
+## [2.2.1](https://github.com/y00njinuk/opencode-claude-auth/compare/v2.2.0...v2.2.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* stop the proactive refresh storm that reported healthy tokens as expired ([3dea655](https://github.com/y00njinuk/opencode-claude-auth/commit/3dea655))
+
+
+### Notable default change
+
+`OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS` now defaults to `0` (disabled),
+restoring the 2.0.0 policy: the 5-minute background timer only mirrors
+already-valid credentials into `auth.json` and never initiates an OAuth
+refresh of its own, leaving refreshing to the request path's 60s window. Set
+a positive value (e.g. `3600000`) to opt back into the 2.1.4 background
+refresh.
+
+The previous 1-hour default made the timer exchange the refresh token on
+every tick for the whole hour before expiry. Because each exchange rotates
+the refresh token server-side, a tick whose write-back lost left the store
+holding a blob that was still valid — and so got adopted straight back,
+repeating the exchange every 5 minutes until the token endpoint answered
+429. That surfaced as `Claude credentials are expired and could not be
+refreshed`, `Proactive token refresh failed`, and a rate-limit 429 on the
+request path, none of which meant the credentials were actually bad.
+
 ## [2.2.0](https://github.com/y00njinuk/opencode-claude-auth/compare/v2.1.6...v2.2.0) (2026-08-20)
 
 
