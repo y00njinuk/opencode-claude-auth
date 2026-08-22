@@ -2990,6 +2990,97 @@ describe("getCredentialsWithBackoff (transient rate-limit resilience)", () => {
       Date.now = originalNow
     }
   })
+
+  it("serves still-usable credentials while a cooldown defers a proactive refresh", async () => {
+    // Regression for the spurious "Proactive token refresh failed. Run
+    // `claude` to re-authenticate." warning. The background timer asks for a
+    // refresh an hour ahead of expiry; when a transient failure has put the
+    // account in cooldown, deferring that refresh used to report "no
+    // credentials" even though the token had ~30 minutes of life left, so the
+    // timer told the user to re-authenticate a perfectly healthy account.
+    const originalNow = Date.now
+    const originalFetch = globalThis.fetch
+    const now = 1_700_000_000_000
+    const usableUntil = now + 30 * 60_000 // 30 min left: usable, but inside 1h
+    const proactiveThreshold = 60 * 60_000
+    Date.now = () => now
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "rate_limit_error" }), {
+        status: 429,
+        headers: { "retry-after": "3600" },
+      })) as typeof fetch
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(usableUntil)
+      const target = makeAccount(usableUntil)
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentials({
+        accessToken: "existing-token",
+        refreshToken: "existing-refresh",
+        expiresAt: usableUntil,
+      })
+
+      // Tick 1: inside the proactive window, so a refresh is attempted; the
+      // 429 sets a cooldown but the still-usable token is handed back.
+      const first = await credentialsModule.refreshIfNeeded(
+        target,
+        proactiveThreshold,
+      )
+      assert.equal(first?.accessToken, "existing-token")
+      assert.equal(credentialsModule.getActiveRefreshFailureKind(), "transient")
+
+      // Tick 2: the cooldown is now active and the store holds nothing
+      // fresher to adopt. Deferring must still yield the usable token — this
+      // returned null before the fix, which is what tripped the warning.
+      const second = await credentialsModule.refreshIfNeeded(
+        target,
+        proactiveThreshold,
+      )
+      assert.equal(
+        second?.accessToken,
+        "existing-token",
+        "A deferred proactive refresh must serve the still-valid token, not null",
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  it("still reports null when a cooldown defers a refresh of an expired token", async () => {
+    // The other side of the fix: inside the reactive window there is no
+    // usable token to serve, so callers must still see null and surface a
+    // retryable error rather than sign a request with a dead token.
+    const originalNow = Date.now
+    const originalFetch = globalThis.fetch
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "rate_limit_error" }), {
+        status: 429,
+        headers: { "retry-after": "3600" },
+      })) as typeof fetch
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now - 1_000)
+      const target = makeAccount(now - 1_000)
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentials({
+        accessToken: "existing-token",
+        refreshToken: "existing-refresh",
+        expiresAt: now - 1_000,
+      })
+
+      assert.equal(await credentialsModule.refreshIfNeeded(target), null)
+      assert.equal(credentialsModule.getActiveRefreshFailureKind(), "transient")
+      // Second call takes the cooldown branch with nothing usable to fall
+      // back on.
+      assert.equal(await credentialsModule.refreshIfNeeded(target), null)
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
 })
 
 describe("cross-process refresh lock (single-flight)", () => {

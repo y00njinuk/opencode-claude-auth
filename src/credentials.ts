@@ -436,6 +436,19 @@ function refreshViaCli(configDir?: string, requireConfigDir = false): boolean {
 }
 
 /**
+ * What to return when a refresh is declined rather than attempted (an active
+ * cooldown, a lock another process holds). Credentials with more than the
+ * reactive window left are still perfectly usable, and reporting them as
+ * "no credentials" is what made a deferred background refresh surface as
+ * "Proactive token refresh failed. Run `claude` to re-authenticate." while
+ * the token had most of an hour left. Callers inside the reactive window
+ * never reach these branches with a usable token, so they still get null.
+ */
+function stillUsable(creds: ClaudeCredentials): ClaudeCredentials | null {
+  return creds.expiresAt > Date.now() + CLI_FALLBACK_THRESHOLD_MS ? creds : null
+}
+
+/**
  * Refreshes the given (or active) account's credentials if they are within
  * `thresholdMs` of expiry. Defaults to 60s, matching the reactive
  * per-request refresh path. Callers that want a proactive refresh further
@@ -520,7 +533,12 @@ export async function refreshIfNeeded(
       source: target.source,
       until: getRefreshCooldownUntil(target.source),
     })
-    return null
+    // Deferring the refresh is not the same as having no credentials. A
+    // caller using a proactive threshold is asking "top this up if you can",
+    // so hand back the token it already has whenever that token still has
+    // more than the reactive window left. Only a caller inside that window
+    // — which already fell through the early return above — gets null.
+    return stillUsable(creds)
   }
 
   // The proactive sync timer calls this directly while the request path
@@ -544,8 +562,9 @@ export async function refreshIfNeeded(
     // The holder produced nothing within the window (likely crashed; its lock
     // ages out by TTL). Defer rather than refresh lock-free, so we don't
     // recreate the burst the lock exists to prevent — the request-level wait
-    // loop and the lock TTL drive eventual progress.
-    return null
+    // loop and the lock TTL drive eventual progress. As in the cooldown
+    // branch, deferring still serves a token that has not expired yet.
+    return stillUsable(creds)
   }
 
   const pending = (async () => {

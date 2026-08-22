@@ -973,9 +973,14 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME
     const originalDebug = process.env.CLAUDE_AUTH_DEBUG
+    const originalProactive = process.env[PROACTIVE_ENV]
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
     const debugLogPath = join(tempHome, "debug.log")
     process.env.HOME = tempHome
+    // Proactive refresh is disabled by default; opt the 1h window back on so
+    // the timer actually takes the branch whose account resolution is under
+    // test here.
+    process.env[PROACTIVE_ENV] = "3600000"
     // Capture the timer's own log ("proactive_refresh_check") so we can
     // assert which account it resolved to. The CLAUDE_AUTH_DEBUG env
     // routes logs to a file (see logger.ts).
@@ -1057,6 +1062,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       } else {
         process.env.CLAUDE_AUTH_DEBUG = originalDebug
       }
+      restoreEnv(PROACTIVE_ENV, originalProactive)
     }
   })
 
@@ -1064,8 +1070,12 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME
     const originalWarn = console.warn
+    const originalProactive = process.env[PROACTIVE_ENV]
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
     process.env.HOME = tempHome
+    // Proactive refresh is off by default, so the timer would never reach the
+    // warn path. Opt the 1h window back on to test the latch itself.
+    process.env[PROACTIVE_ENV] = "3600000"
 
     let tickCallback: (() => void | Promise<void>) | undefined
     globalThis.setInterval = ((cb: () => void | Promise<void>) => {
@@ -1129,6 +1139,59 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       } else {
         delete process.env.HOME
       }
+      restoreEnv(PROACTIVE_ENV, originalProactive)
+    }
+  })
+
+  it("init does not tell the user to re-authenticate on a transient refresh failure", async () => {
+    // Regression for "Claude credentials are expired and could not be
+    // refreshed. Run `claude` to re-authenticate." appearing at startup for a
+    // rate-limited refresh. A 429 leaves the refresh token valid for weeks,
+    // so re-authenticating fixes nothing; the request path handles it by
+    // waiting the cooldown out and reporting a retryable error.
+    const originalSetInterval = globalThis.setInterval
+    const originalHome = process.env.HOME
+    const originalWarn = console.warn
+    const originalFetch = globalThis.fetch
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    process.env.HOME = tempHome
+    globalThis.setInterval = (() => ({
+      unref() {},
+    })) as unknown as typeof setInterval
+    // The token endpoint rate-limits every refresh attempt during init.
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "rate_limit_error" }), {
+        status: 429,
+        headers: { "retry-after": "3600" },
+      })) as typeof fetch
+
+    const warnMessages: string[] = []
+    console.warn = ((...args: unknown[]) => {
+      warnMessages.push(String(args[0]))
+    }) as typeof console.warn
+
+    try {
+      // Already expired, so init must attempt a refresh rather than
+      // short-circuiting on a still-valid token.
+      const { helpersModule } = await loadHelpersWithCountingKeychain(
+        Date.now() - 60_000,
+      )
+      await helpersModule.default({} as never)
+
+      const reauthWarnings = warnMessages.filter((m) =>
+        m.includes("could not be refreshed"),
+      )
+      assert.equal(
+        reauthWarnings.length,
+        0,
+        `A rate-limited refresh must not surface as "run \`claude\`" at ` +
+          `init. Got: ${JSON.stringify(warnMessages)}`,
+      )
+    } finally {
+      globalThis.setInterval = originalSetInterval
+      globalThis.fetch = originalFetch
+      console.warn = originalWarn
+      restoreEnv("HOME", originalHome)
     }
   })
 
@@ -1147,12 +1210,32 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     )
   })
 
-  it("proactive refresh window falls back to 1h on unparseable or negative env values", async () => {
+  it("proactive refresh is disabled by default (2.0.0 sync-only timer)", async () => {
+    // Regression for the refresh storm: with a 1h default, the timer
+    // exchanged the refresh token every 5 minutes for the whole hour before
+    // expiry, eventually drawing a 429 from the token endpoint. The default
+    // timer must mirror credentials into auth.json and nothing else.
+    const logs = await captureProactiveTickLog(undefined)
+    assert.ok(
+      !logs.includes("proactive_refresh_check"),
+      `Timer must not enter the refresh path by default. Log: ${logs}`,
+    )
+    assert.ok(
+      !logs.includes("refresh_needed"),
+      `Timer must not initiate an OAuth refresh by default. Log: ${logs}`,
+    )
+    assert.ok(
+      logs.includes("sync_auth_json"),
+      `auth.json must still be synced by default. Log: ${logs}`,
+    )
+  })
+
+  it("proactive refresh window falls back to the default on unparseable or negative env values", async () => {
     for (const raw of ["abc", "-1", ""]) {
       const logs = await captureProactiveTickLog(raw)
       assert.ok(
-        logs.includes('"thresholdMs":3600000'),
-        `Expected the 1h default for env value ${JSON.stringify(raw)}. ` +
+        !logs.includes("proactive_refresh_check"),
+        `Expected the disabled default for env value ${JSON.stringify(raw)}. ` +
           `Log: ${logs}`,
       )
     }

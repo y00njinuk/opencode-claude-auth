@@ -171,14 +171,31 @@ export function buildRequestHeaders(
 
 const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
 
-const DEFAULT_PROACTIVE_REFRESH_THRESHOLD_MS = 60 * 60 * 1000 // 1 hour before expiry
+// Proactive background refresh is OFF by default, which restores the 2.0.0
+// token policy: the 5-minute timer only mirrors already-valid credentials
+// into auth.json and never initiates an OAuth refresh of its own.
+//
+// The 1-hour window shipped in 2.1.4 made the timer exchange the refresh
+// token on every tick for the entire hour before expiry. Each exchange
+// rotates the refresh token server-side, so any tick whose write-back loses
+// (a concurrent `claude` rotation, or a keychain ACL that permits read but
+// not write) leaves the store holding the pre-refresh blob — still valid for
+// the rest of that hour, so refreshIfNeeded's validated re-read adopts it
+// straight back and the next tick repeats the whole exchange. Sustained
+// indefinitely, that drives the token endpoint to 429, which surfaced as
+// three misleading messages: "credentials are expired and could not be
+// refreshed" at init, "Proactive token refresh failed" from the timer, and a
+// rate-limit 429 on the request path — none of which meant the stored
+// credentials were actually bad.
+const DEFAULT_PROACTIVE_REFRESH_THRESHOLD_MS = 0
 
 /**
  * How far ahead of expiry the background sync timer refreshes the token.
- * `0` disables proactive refresh entirely: the timer then only syncs
- * auth.json from already-valid cached credentials, which is the pre-2.1.4
- * behaviour for anyone who would rather let the reactive (60s) path do all
- * the refreshing. Invalid or negative values fall back to the default.
+ * `0` (the default) disables proactive refresh entirely: the timer then only
+ * syncs auth.json from already-valid cached credentials and the reactive
+ * (60s) request path does all the refreshing. Set a positive value to opt
+ * back into the 2.1.4 background refresh. Invalid or negative values fall
+ * back to the default.
  */
 const PROACTIVE_REFRESH_THRESHOLD_MS = (() => {
   const raw = process.env.OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS
@@ -225,6 +242,16 @@ const plugin: Plugin = async () => {
     const initialCreds = await getCachedCredentials()
     if (initialCreds) {
       syncAuthJson(initialCreds)
+    } else if (getActiveRefreshFailureKind() === "transient") {
+      // A rate-limited / 5xx / network-blip refresh says nothing about
+      // whether the stored credentials are still good — the refresh token
+      // outlives its access token by weeks. Telling the user to re-run
+      // `claude` here sends them to fix an account that is not broken, so
+      // leave it to the request path, which waits the cooldown out and
+      // reports a retryable 429 if it still cannot get a token.
+      log("plugin_init_refresh_transient", {
+        source: defaultAccount.source,
+      })
     } else {
       console.warn(
         "opencode-claude-auth: Claude credentials are expired and could not be refreshed. Run `claude` to re-authenticate.",
@@ -271,10 +298,13 @@ const plugin: Plugin = async () => {
           }
           proactiveRefreshWarned = false
         } else {
-          log("proactive_refresh_failed", { source: account?.source })
-          // Only warn once per outage — otherwise this fires every
-          // SYNC_INTERVAL (5 min) for as long as refresh keeps failing.
-          if (!proactiveRefreshWarned) {
+          const kind = getActiveRefreshFailureKind()
+          log("proactive_refresh_failed", { source: account?.source, kind })
+          // Same reasoning as the init path: a transient failure leaves the
+          // refresh token usable, and a background tick failing is not a
+          // reason to send the user to re-authenticate. Only warn once per
+          // outage, and only when the refresh token itself is dead.
+          if (!proactiveRefreshWarned && kind !== "transient") {
             proactiveRefreshWarned = true
             console.warn(
               "opencode-claude-auth: Proactive token refresh failed. Run `claude` to re-authenticate.",
