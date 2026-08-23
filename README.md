@@ -9,7 +9,7 @@ Self-contained Anthropic auth provider for OpenCode using your Claude Code crede
 >
 > Fork-only change:
 >
-> - **The `claude` CLI performs token refreshes; the plugin never calls the OAuth token endpoint itself.** This is upstream 2.0.0's policy, restored deliberately. Upstream 2.1.5+ refreshes in-process, which fails on any network that blocks or TLS-intercepts `claude.ai` while allowing `api.anthropic.com` — common on corporate networks — and upstream 2.1.6+ removed the CLI fallback that used to rescue it, so such a network has no recovery path there. It also means this plugin never has to persist a rotated refresh token, removing the failure where a lost write-back leaves the account unrecoverable without an interactive re-login. The cost is that a refresh runs `claude -p . --model haiku`: one small billed request and a brief freeze, a handful of times a day. Tunable via `OPENCODE_CLAUDE_AUTH_CLI_TIMEOUT_MS` and `OPENCODE_CLAUDE_AUTH_CLI_COOLDOWN_MS`.
+> - **The `claude` CLI performs token refreshes; the plugin never calls the OAuth token endpoint itself.** Upstream refreshes in-process, which fails on any network that blocks or TLS-intercepts `claude.ai` while allowing `api.anthropic.com` — common on corporate networks. Delegating to the CLI also means this plugin never has to persist a rotated refresh token, removing the failure where a lost write-back leaves the account unrecoverable without an interactive re-login. The cost is that a refresh runs `claude -p . --model haiku`: one small billed request and a brief freeze, a handful of times a day. Tunable via `OPENCODE_CLAUDE_AUTH_CLI_TIMEOUT_MS` and `OPENCODE_CLAUDE_AUTH_CLI_COOLDOWN_MS`. See [Appendix: 토큰 정책](#appendix-토큰-정책-한글).
 
 ## How it works
 
@@ -101,18 +101,19 @@ If only one account is found, the switcher is hidden and the plugin uses it dire
 
 ## Troubleshooting
 
-| Problem                                             | Solution                                                                                                                                                                                                                                                                     |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| "Credentials not found"                             | Run `claude` to authenticate with Claude Code first                                                                                                                                                                                                                          |
-| "Keychain is locked"                                | Run `security unlock-keychain ~/Library/Keychains/login.keychain-db`                                                                                                                                                                                                         |
-| "Token expired and refresh failed"                  | The plugin runs `claude` CLI to refresh automatically. If this fails, re-authenticate manually by running `claude`                                                                                                                                                           |
-| Not working on Linux/Windows                        | Ensure `~/.claude/.credentials.json` exists (or `$CLAUDE_CONFIG_DIR/.credentials.json` if that env var is set). Run `claude` to create it                                                                                                                                    |
-| Keychain access denied                              | Grant access when macOS prompts you                                                                                                                                                                                                                                          |
-| Keychain read timed out                             | Restart Keychain Access (can happen on macOS Tahoe)                                                                                                                                                                                                                          |
-| "Credentials are unavailable or expired"            | Run `claude` to refresh your Claude Code credentials                                                                                                                                                                                                                         |
-| "`claude` could not refresh them"                   | The plugin refreshes by running the `claude` CLI. Check that `claude` works on this machine — it reaches `claude.ai` to refresh, which working `api.anthropic.com` access does not imply. `CLAUDE_AUTH_DEBUG=1` records the proxy/TLS environment and every refresh attempt. |
-| "Extra usage is required for long context requests" | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                                                                                                                                                      |
-| Plugin not updating to latest version               | Delete the cached package: `rm -rf ~/.cache/opencode/packages/@y00njinuk/opencode-claude-auth@latest/` then restart OpenCode                                                                                                                                                 |
+| Problem                                                | Solution                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "Credentials not found"                                | Run `claude` to authenticate with Claude Code first                                                                                                                                                                                                                             |
+| "Keychain is locked"                                   | Run `security unlock-keychain ~/Library/Keychains/login.keychain-db`                                                                                                                                                                                                            |
+| "Token expired and refresh failed"                     | The plugin runs `claude` CLI to refresh automatically. If this fails, re-authenticate manually by running `claude`                                                                                                                                                              |
+| Not working on Linux/Windows                           | Ensure `~/.claude/.credentials.json` exists (or `$CLAUDE_CONFIG_DIR/.credentials.json` if that env var is set). Run `claude` to create it                                                                                                                                       |
+| Keychain access denied                                 | Grant access when macOS prompts you                                                                                                                                                                                                                                             |
+| Keychain read timed out                                | Restart Keychain Access (can happen on macOS Tahoe)                                                                                                                                                                                                                             |
+| "Credentials are unavailable or expired"               | Run `claude` to refresh your Claude Code credentials                                                                                                                                                                                                                            |
+| Credentials ignored, or `claude` runs on every request | `$CLAUDE_CONFIG_DIR/.credentials.json` needs `accessToken` and `refreshToken` as strings and `expiresAt` as **epoch milliseconds**. A hand-assembled file with `expiresAt: 0` reads as permanently expired and forces a refresh on every request. Check the container clock too |
+| "`claude` could not refresh them"                      | The plugin refreshes by running the `claude` CLI. Check that `claude` works on this machine — it reaches `claude.ai` to refresh, which working `api.anthropic.com` access does not imply. `CLAUDE_AUTH_DEBUG=1` records the proxy/TLS environment and every refresh attempt.    |
+| "Extra usage is required for long context requests"    | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                                                                                                                                                         |
+| Plugin not updating to latest version                  | Delete the cached package: `rm -rf ~/.cache/opencode/packages/@y00njinuk/opencode-claude-auth@latest/` then restart OpenCode                                                                                                                                                    |
 
 ### Diagnostic logging
 
@@ -141,17 +142,6 @@ unset CLAUDE_AUTH_DEBUG
 1M token context is supported natively — the API no longer requires a beta flag for it, so the plugin doesn't send the legacy `context-1m-2025-08-07` header.
 
 If your plan doesn't cover long context billing, requests beyond the standard window fail with "Extra usage is required for long context requests". When a long context error is caused by a beta flag (e.g. one added via `ANTHROPIC_BETA_FLAGS`), the plugin retries without the offending flag.
-
-## Validating OAuth refresh
-
-To verify the direct OAuth token refresh works with your credentials:
-
-```bash
-pnpm run validate:oauth           # refresh + write-back (safe, keeps credentials valid)
-pnpm run validate:oauth -- --dry-run  # show what would be sent without making the request
-```
-
-This reads your stored credentials, calls Anthropic's OAuth token endpoint, and writes the new tokens back to storage. Refresh tokens rotate on each use, so write-back is enabled by default to keep your stored credentials valid.
 
 ## Environment variable overrides
 
@@ -188,17 +178,37 @@ export ANTHROPIC_CLI_VERSION=2.2.0
 - Sets required API headers (beta flags, billing, user-agent) with model-aware selection
 - On macOS, enumerates all `Claude Code-credentials*` Keychain entries and labels them by subscription tier
 - Provides an account switcher via `opencode auth login` when multiple accounts are found; persists selection to `~/.local/share/opencode/claude-account-source.txt`
-- Syncs credentials to `auth.json` on startup and every 5 minutes as a fallback; that same tick proactively refreshes once the token is within an hour of expiry
+- Syncs credentials to `auth.json` on startup and every 5 minutes as a fallback. That tick only mirrors credentials that are already valid — it never refreshes, so it can never turn into a `claude` run on a timer
 - On Windows, writes to both `%USERPROFILE%\.local\share\opencode\auth.json` and `%LOCALAPPDATA%\opencode\auth.json`
-- Re-reads the credential source on every cache miss, so an account rotated by something other than this plugin — the `claude` CLI in another terminal, a second OpenCode instance, or a switcher like [claude-swap](https://github.com/realiti4/claude-swap) — gets picked up mid-session without a restart. Bounded by the same 30s cache, so it adds at most about two source reads a minute under load. A stored token is adopted whenever it is usable, and when it isn't only if the one already held is also unusable — otherwise a failed write-back would resurrect the pre-refresh token it left behind
-- Guards credential write-back with the access token the refresh started from, so a switch landing mid-refresh can't write one account's rotated tokens into another account's slot
+- Re-reads the credential source on every cache miss, so an account rotated by something other than this plugin — the `claude` CLI in another terminal, a second OpenCode instance, or a switcher like [claude-swap](https://github.com/realiti4/claude-swap) — gets picked up mid-session without a restart. Bounded by the same 30s cache, so it adds at most about two source reads a minute under load. A stored blob is adopted unconditionally: since this plugin never writes credentials, a disagreement between memory and the store can only mean the store is newer
 - Retries API requests on 429 (rate limit) and 529 (overloaded) with exponential backoff, respecting `retry-after` headers
 - On a 429 that outlives those backoff retries, re-reads the source once and retries only if the access token changed, so a rate limit another process has already resolved by switching accounts isn't surfaced. A changed token isn't proof of a switch — a routine refresh of the same account changes it too — so this costs at most one extra request
-- On a 401, recovers in place rather than surfacing it: adopts an externally rotated token if the source now holds one, otherwise forces an OAuth refresh, then retries the request. Bounded at two attempts, so a rejected token costs at most three API calls. A 401 that survives recovery is returned unmodified, without SSE stream transformation, since it carries an error body rather than a stream
-- Refreshes directly via `POST https://claude.ai/v1/oauth/token` using the runtime's own `fetch` (no LLM tokens consumed, no subprocess). Requests are triggered within 60 seconds of expiry on the API request path and within an hour on the background tick; concurrent refreshes of one account share a single request, since each rotation invalidates the previous refresh token
-- Falls back to the `claude` CLI only within the 60-second window, the point at which Claude Code will actually rotate the token — running it earlier costs a real API request and returns the same token. New tokens are written back to Keychain (macOS) or credentials file (Linux/Windows) to keep stored credentials in sync with rotated refresh tokens
+- On a 401, recovers in place rather than surfacing it: adopts an externally rotated token if the source now holds one, otherwise runs the `claude` CLI to force a refresh, then retries the request. Bounded at two attempts, so a rejected token costs at most three API calls. The forced refresh is cooldown-gated and only counts as success if the access token actually changed, so a 401 loop cannot become a spawn loop. A 401 that survives recovery is returned unmodified, without SSE stream transformation, since it carries an error body rather than a stream
+- Refreshes by running the `claude` CLI, never by calling the OAuth token endpoint itself. The CLI owns the credential store and rotates and persists in one step, so this plugin never has to write credentials — and can never strand a rotated refresh token. Triggered only within 60 seconds of expiry, the point at which Claude Code will actually rotate; concurrent refreshes of one account share a single run, in-process and across processes, since each rotation invalidates the previous refresh token. See [Appendix: 토큰 정책](#appendix-토큰-정책-한글)
 - If credentials aren't OAuth-based, the auth loader returns `{}` and falls through to API key auth
 - If credentials are unavailable or unreadable, the plugin disables itself and OpenCode continues without Claude auth
+
+## Appendix: 토큰 정책 (한글)
+
+### 정책
+
+**이 플러그인은 OAuth 토큰 엔드포인트를 직접 호출하지 않는다.**
+토큰 갱신은 전적으로 `claude` CLI가 수행하고, 플러그인은 CLI가 자격증명 저장소에 쓴 것을 읽기만 한다.
+
+- 플러그인은 자격증명을 저장소에 쓰지 않는다.
+- 갱신은 만료 60초 이내에, 요청 경로에서만 일어난다.
+- 백그라운드 타이머는 이미 유효한 자격증명을 `auth.json`에 미러링만 한다.
+- 플러그인 init은 `claude`를 실행하지 않는다.
+
+### 목적
+
+- **차단된 망에서의 동작 보장.** API 요청은 `api.anthropic.com`으로, 토큰 갱신은 `claude.ai`로
+  간다. 후자만 차단된 환경에서도 갱신이 가능해야 한다.
+- **refresh token 유실 방지.** 갱신은 refresh token을 회전시키므로, 회전과 저장이 한 곳에서
+  원자적으로 일어나야 한다.
+
+이 정책을 코드에서 강제하기 위한 규약과 불변 조건은 [`CLAUDE.md`](CLAUDE.md)에 있다.
+갱신 경로를 수정하기 전에 반드시 읽어야 한다.
 
 ## Disclaimer
 
