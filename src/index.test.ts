@@ -131,7 +131,6 @@ const SOURCE_FILES = [
   "signing.ts",
   "transforms.ts",
   "credentials.ts",
-  "refresh-backoff.ts",
   "refresh-lock.ts",
   "logger.ts",
   "http.ts",
@@ -150,8 +149,9 @@ async function copySourceFiles(
       )
       if (file === "credentials.ts") {
         if (opts?.oauthTokenUrl) {
-          // Point the OAuth refresh at a local test server so the real
-          // refreshViaOAuth path runs offline.
+          // Only the startup diagnostic reads this constant now — the plugin
+          // itself never dials it, the `claude` CLI does. Substituting it still
+          // lets a test assert which host is reported.
           source = source.replace(
             "https://claude.ai/v1/oauth/token",
             opts.oauthTokenUrl,
@@ -167,11 +167,21 @@ async function copySourceFiles(
     }),
   )
 
+  // The `claude` spawn is stubbed, never real. __setExecSyncImpl lets a test
+  // act out what a real run does to the store — rotate the credentials — which
+  // is how the 401 recovery path is exercised now that the CLI, not an
+  // in-process OAuth call, performs the refresh.
   await writeFile(
     join(tempDir, "child-process.ts"),
-    `export function execSync() {
+    `let count = 0
+let impl = null
+export function execSync(command, options) {
+  count += 1
+  if (impl) return impl(command, options)
   return ""
 }
+export function __getExecSyncCount() { return count }
+export function __setExecSyncImpl(fn) { impl = fn }
 `,
     "utf8",
   )
@@ -185,6 +195,12 @@ async function loadHelpersWithCountingKeychain(
   keychainModule: {
     __getReadCount: () => number
     __setCredentials: (c: ClaudeCredentials) => void
+  }
+  childProcessModule: {
+    __getExecSyncCount: () => number
+    __setExecSyncImpl: (
+      fn: ((command: string, options?: unknown) => string) | null,
+    ) => void
   }
 }> {
   const tempDir = await mkdtemp(join(tmpdir(), "opencode-claude-auth-cache-"))
@@ -249,11 +265,21 @@ export function __setCredentials(c) {
     import(pathToFileURL(tempKeychain).href),
   ])
 
+  const childProcessModule = await import(
+    pathToFileURL(join(tempDir, "child-process.ts")).href
+  )
+
   return {
     helpersModule,
     keychainModule: keychainModule as {
       __getReadCount: () => number
       __setCredentials: (c: ClaudeCredentials) => void
+    },
+    childProcessModule: childProcessModule as {
+      __getExecSyncCount: () => number
+      __setExecSyncImpl: (
+        fn: ((command: string, options?: unknown) => string) | null,
+      ) => void
     },
   }
 }
@@ -262,7 +288,7 @@ export function __setCredentials(c) {
  * Fake keychain with TWO accounts, used to regression-test the proactive
  * refresh timer's account resolution (bug: it used to read the closure-
  * captured `accounts[0]` instead of the currently active account after a
- * switch). Both accounts get `refreshToken: ""` so `refreshViaOAuth()`'s
+ * switch). Both accounts get `refreshToken: ""` so the refresh path's
  * `if (creds.refreshToken)` guard skips it entirely — no real network call
  * — and the refresh cascade falls straight through to the CLI fallback
  * (which fails fast with ENOENT since `claude` isn't installed in test
@@ -326,58 +352,71 @@ function restoreEnv(key: string, previous: string | undefined): void {
   }
 }
 
-const PROACTIVE_ENV = "OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS"
+/**
+ * The proxy/TLS variables the init network-env diagnostic reports on. Every
+ * one of them is cleared before a capture so a setting inherited from the
+ * developer's own shell cannot make a presence assertion pass for the wrong
+ * reason, and all of them are put back afterwards.
+ */
+const NETWORK_ENV_KEYS = [
+  "HTTPS_PROXY",
+  "https_proxy",
+  "HTTP_PROXY",
+  "http_proxy",
+  "NO_PROXY",
+  "no_proxy",
+  "NODE_EXTRA_CA_CERTS",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+] as const
 
 /**
- * Boot the plugin against the two-account fake keychain with
- * OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS set to `envValue`, fire exactly
- * one background sync tick, and return only the debug log that tick wrote.
- * index.ts reads the env var once at module scope, so it has to be in place
- * before the import — which resolves to a freshly copied (hence uncached)
- * module per call, so each case gets its own evaluation of the threshold.
+ * Boot the plugin against the two-account fake keychain with `env` applied on
+ * top of a cleared proxy/TLS environment, and return both the whole init debug
+ * log and the parsed `plugin_init_network_env` entry. Both accounts sit far
+ * from expiry with an empty refresh token, so init resolves credentials with
+ * no network call and no CLI fallback — the log is the only thing under test.
  */
-async function captureProactiveTickLog(
-  envValue: string | undefined,
-): Promise<string> {
+async function captureInitLog(
+  env: Record<string, string>,
+): Promise<{ raw: string; entry: Record<string, unknown> }> {
   const originalSetInterval = globalThis.setInterval
   const originalHome = process.env.HOME
   const originalDebug = process.env.CLAUDE_AUTH_DEBUG
-  const originalProactive = process.env[PROACTIVE_ENV]
+  const originalNetworkEnv = NETWORK_ENV_KEYS.map(
+    (key) => [key, process.env[key]] as const,
+  )
   const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
   const debugLogPath = join(tempHome, "debug.log")
   process.env.HOME = tempHome
   process.env.CLAUDE_AUTH_DEBUG = debugLogPath
-  restoreEnv(PROACTIVE_ENV, envValue)
+  for (const key of NETWORK_ENV_KEYS) delete process.env[key]
+  for (const [key, value] of Object.entries(env)) process.env[key] = value
 
-  let tickCallback: (() => void | Promise<void>) | undefined
-  globalThis.setInterval = ((cb: () => void | Promise<void>) => {
-    tickCallback = cb
-    return { unref() {} }
-  }) as unknown as typeof setInterval
+  globalThis.setInterval = (() => ({
+    unref() {},
+  })) as unknown as typeof setInterval
 
   try {
     const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
-      // Both accounts far from expiry, so refreshIfNeeded short-circuits on
-      // the still-valid token: the tick exercises threshold resolution only,
-      // with no refresh attempt and no CLI fallback to slow it down.
       aExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
       bExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
       bRefreshResult: "success",
     })
 
     await helpersModule.default({} as never)
-    assert.ok(tickCallback, "Expected setInterval to capture the tick callback")
 
-    // Truncate so only entries produced by the tick are inspected.
-    await writeFile(debugLogPath, "", "utf-8")
-    await tickCallback!()
+    const raw = await readFile(debugLogPath, "utf-8")
+    const line = raw
+      .split("\n")
+      .find((l) => l.includes('"plugin_init_network_env"'))
+    assert.ok(line, `Expected a plugin_init_network_env entry, got: ${raw}`)
 
-    return await readFile(debugLogPath, "utf-8")
+    return { raw, entry: JSON.parse(line) as Record<string, unknown> }
   } finally {
     globalThis.setInterval = originalSetInterval
     restoreEnv("HOME", originalHome)
     restoreEnv("CLAUDE_AUTH_DEBUG", originalDebug)
-    restoreEnv(PROACTIVE_ENV, originalProactive)
+    for (const [key, value] of originalNetworkEnv) restoreEnv(key, value)
   }
 }
 
@@ -719,7 +758,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     assert.ok(elapsed >= 900, `Expected at least 900ms delay, got ${elapsed}ms`)
   })
 
-  // refreshViaOAuth bounds its whole request with an AbortController. If the
+  // fetchWithRetry bounds its whole request with an AbortController. If the
   // backoff ignores that signal, the effective timeout is the retry delay
   // (capped at 30s) rather than the 15s the caller asked for.
   it("fetchWithRetry stops backing off once the request is aborted", async () => {
@@ -969,180 +1008,6 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
-  it("proactive refresh timer targets the ACTIVE account after a switch, not accounts[0]", async () => {
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalDebug = process.env.CLAUDE_AUTH_DEBUG
-    const originalProactive = process.env[PROACTIVE_ENV]
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    const debugLogPath = join(tempHome, "debug.log")
-    process.env.HOME = tempHome
-    // Proactive refresh is disabled by default; opt the 1h window back on so
-    // the timer actually takes the branch whose account resolution is under
-    // test here.
-    process.env[PROACTIVE_ENV] = "3600000"
-    // Capture the timer's own log ("proactive_refresh_check") so we can
-    // assert which account it resolved to. The CLAUDE_AUTH_DEBUG env
-    // routes logs to a file (see logger.ts).
-    process.env.CLAUDE_AUTH_DEBUG = debugLogPath
-
-    let tickCallback: (() => void | Promise<void>) | undefined
-    globalThis.setInterval = ((cb: () => void | Promise<void>) => {
-      tickCallback = cb
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-
-    try {
-      const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
-        // accounts[0] ("acct-a") — far from expiry. The pre-fix code used
-        // THIS account's expiry to decide whether to take the proactive
-        // branch at all, regardless of which account is actually active.
-        aExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
-        // Active account after the switch below — within the 1h proactive
-        // window but past the 60s reactive threshold, so authorize()'s own
-        // getCachedCredentials() call must NOT refresh it (isolating the
-        // timer as the only thing that triggers a refresh here).
-        bExpiresAt: Date.now() + 10 * 60 * 1000,
-        bRefreshResult: "success",
-      })
-
-      const plugin = await helpersModule.default({} as never)
-      assert.ok(
-        tickCallback,
-        "Expected setInterval to capture the tick callback",
-      )
-
-      const typedPlugin = plugin as {
-        auth?: {
-          methods?: Array<{
-            authorize?: (i: { account?: string }) => Promise<unknown>
-          }>
-        }
-      }
-      await typedPlugin.auth!.methods![0]!.authorize!({ account: "acct-b" })
-
-      // Truncate the log so we only inspect entries produced by the tick.
-      await writeFile(debugLogPath, "", "utf-8")
-
-      // Fire the timer tick manually — this is the only thing that should
-      // trigger a refresh in this scenario.
-      await tickCallback!()
-
-      const logs = await readFile(debugLogPath, "utf-8")
-      // The fix: timer's proactive_refresh_check should reference the
-      // ACTIVE account (acct-b), not the closure-captured accounts[0]
-      // (acct-a). With the accounts[0] bug, the log would show
-      // "source":"acct-a" here.
-      const proactiveCheckEntries = logs
-        .split("\n")
-        .filter((line) => line.includes("proactive_refresh_check"))
-      assert.ok(
-        proactiveCheckEntries.length > 0,
-        `Expected proactive_refresh_check log entry, got log: ${logs}`,
-      )
-      assert.ok(
-        proactiveCheckEntries.some((l) => l.includes('"source":"acct-b"')),
-        `Timer should resolve ACTIVE account (acct-b) after switch, not ` +
-          `accounts[0] (acct-a). Log: ${logs}`,
-      )
-      assert.ok(
-        !proactiveCheckEntries.some((l) => l.includes('"source":"acct-a"')),
-        "Timer should NOT be checking accounts[0] after switch. " +
-          `Log: ${logs}`,
-      )
-    } finally {
-      globalThis.setInterval = originalSetInterval
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-      if (originalDebug === undefined) {
-        delete process.env.CLAUDE_AUTH_DEBUG
-      } else {
-        process.env.CLAUDE_AUTH_DEBUG = originalDebug
-      }
-      restoreEnv(PROACTIVE_ENV, originalProactive)
-    }
-  })
-
-  it("proactive refresh timer warns at most once per outage (no spam on repeated failures)", async () => {
-    const originalSetInterval = globalThis.setInterval
-    const originalHome = process.env.HOME
-    const originalWarn = console.warn
-    const originalProactive = process.env[PROACTIVE_ENV]
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
-    process.env.HOME = tempHome
-    // Proactive refresh is off by default, so the timer would never reach the
-    // warn path. Opt the 1h window back on to test the latch itself.
-    process.env[PROACTIVE_ENV] = "3600000"
-
-    let tickCallback: (() => void | Promise<void>) | undefined
-    globalThis.setInterval = ((cb: () => void | Promise<void>) => {
-      tickCallback = cb
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-
-    const warnMessages: string[] = []
-    console.warn = ((...args: unknown[]) => {
-      warnMessages.push(String(args[0]))
-    }) as typeof console.warn
-
-    try {
-      const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
-        // Set acct-a to ALREADY EXPIRED so upstream's tryFallbackAccount
-        // cannot borrow its creds when acct-b's refresh fails. Without
-        // this, the new fallback would return acct-a's still-valid creds
-        // and refreshIfNeeded would return non-null — making the warn
-        // path unreachable and the latch untestable.
-        aExpiresAt: Date.now() - 60_000,
-        // Inside the reactive window, so the refresh chain runs to
-        // exhaustion instead of short-circuiting on still-usable creds.
-        bExpiresAt: Date.now() + 30_000,
-        bRefreshResult: "fail",
-      })
-
-      const plugin = await helpersModule.default({} as never)
-      assert.ok(tickCallback)
-
-      const typedPlugin = plugin as {
-        auth?: {
-          methods?: Array<{
-            authorize?: (i: { account?: string }) => Promise<unknown>
-          }>
-        }
-      }
-      await typedPlugin.auth!.methods![0]!.authorize!({ account: "acct-b" })
-
-      warnMessages.length = 0 // ignore any warnings emitted during init/authorize
-
-      // Simulate 3 consecutive failed sync ticks (15 minutes of downtime).
-      // Awaited individually: real ticks are 5 minutes apart, so each one
-      // completes long before the next fires.
-      await tickCallback!()
-      await tickCallback!()
-      await tickCallback!()
-
-      const proactiveWarnings = warnMessages.filter((m) =>
-        m.includes("Proactive token refresh failed"),
-      )
-      assert.equal(
-        proactiveWarnings.length,
-        1,
-        `Expected exactly 1 warning across 3 failed ticks (latched), got ${proactiveWarnings.length}`,
-      )
-    } finally {
-      globalThis.setInterval = originalSetInterval
-      console.warn = originalWarn
-      if (typeof originalHome === "string") {
-        process.env.HOME = originalHome
-      } else {
-        delete process.env.HOME
-      }
-      restoreEnv(PROACTIVE_ENV, originalProactive)
-    }
-  })
-
   it("init does not tell the user to re-authenticate on a transient refresh failure", async () => {
     // Regression for "Claude credentials are expired and could not be
     // refreshed. Run `claude` to re-authenticate." appearing at startup for a
@@ -1195,108 +1060,106 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
-  it("proactive refresh window is overridable via OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS", async () => {
-    const logs = await captureProactiveTickLog("120000")
-    const entries = logs
-      .split("\n")
-      .filter((line) => line.includes("proactive_refresh_check"))
-    assert.ok(
-      entries.length > 0,
-      `Expected proactive_refresh_check log entry, got log: ${logs}`,
-    )
-    assert.ok(
-      entries.every((line) => line.includes('"thresholdMs":120000')),
-      `Timer should refresh against the env-provided window. Log: ${logs}`,
-    )
-  })
+  it("init records proxy/TLS environment as presence booleans, never values", async () => {
+    // The bug class this diagnostic serves is a corporate proxy that blocks
+    // or MITM-intercepts the OAuth token host while letting api.anthropic.com
+    // through. Knowing a proxy is configured is the whole diagnostic value;
+    // the URL itself is a secret — it routinely carries credentials, and this
+    // log is something users paste into issue reports.
+    const proxySecret =
+      "http://svc-opencode:hunter2-not-a-real-password@proxy.corp.example:8080"
+    const caPath = "/etc/corp-pki/internal-root-ca.pem"
 
-  it("proactive refresh is disabled by default (2.0.0 sync-only timer)", async () => {
-    // Regression for the refresh storm: with a 1h default, the timer
-    // exchanged the refresh token every 5 minutes for the whole hour before
-    // expiry, eventually drawing a 429 from the token endpoint. The default
-    // timer must mirror credentials into auth.json and nothing else.
-    const logs = await captureProactiveTickLog(undefined)
-    assert.ok(
-      !logs.includes("proactive_refresh_check"),
-      `Timer must not enter the refresh path by default. Log: ${logs}`,
-    )
-    assert.ok(
-      !logs.includes("refresh_needed"),
-      `Timer must not initiate an OAuth refresh by default. Log: ${logs}`,
-    )
-    assert.ok(
-      logs.includes("sync_auth_json"),
-      `auth.json must still be synced by default. Log: ${logs}`,
-    )
-  })
+    const { raw, entry } = await captureInitLog({
+      HTTPS_PROXY: proxySecret,
+      http_proxy: proxySecret,
+      NODE_EXTRA_CA_CERTS: caPath,
+    })
 
-  it("proactive refresh window falls back to the default on unparseable or negative env values", async () => {
-    for (const raw of ["abc", "-1", ""]) {
-      const logs = await captureProactiveTickLog(raw)
+    assert.equal(entry.HTTPS_PROXY, true)
+    assert.equal(entry.http_proxy, true)
+    assert.equal(entry.NODE_EXTRA_CA_CERTS, true)
+    // The unset half proves each variable is read on its own rather than
+    // mirrored from a sibling: https_proxy and HTTP_PROXY differ only in case
+    // from the two that ARE set, so a case-insensitive lookup would show up
+    // here as a false positive.
+    assert.equal(entry.https_proxy, false)
+    assert.equal(entry.HTTP_PROXY, false)
+    assert.equal(entry.NO_PROXY, false)
+    assert.equal(entry.no_proxy, false)
+    assert.equal(entry.NODE_TLS_REJECT_UNAUTHORIZED, false)
+
+    // Scan the WHOLE init log, not just this entry — a leak anywhere in init
+    // is still a leak, and the credential can only have come from the env.
+    for (const secret of [
+      proxySecret,
+      "hunter2-not-a-real-password",
+      "svc-opencode",
+      "proxy.corp.example",
+      caPath,
+    ]) {
       assert.ok(
-        !logs.includes("proactive_refresh_check"),
-        `Expected the disabled default for env value ${JSON.stringify(raw)}. ` +
-          `Log: ${logs}`,
+        !raw.includes(secret),
+        `Debug log leaked ${JSON.stringify(secret)} — the network-env entry ` +
+          `must record presence only. Log: ${raw}`,
       )
     }
   })
 
-  it("OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS=0 stops the timer refreshing but keeps auth.json synced", async () => {
-    const logs = await captureProactiveTickLog("0")
+  it("init network-env log names the OAuth token host", async () => {
+    // Derived from the constant the refresh path actually dials, so the log
+    // cannot quietly go on naming a host we stopped talking to.
+    const { OAUTH_TOKEN_URL } = await import("./credentials.ts")
+    const { entry } = await captureInitLog({})
+
+    assert.equal(entry.oauthTokenHost, new URL(OAUTH_TOKEN_URL).host)
+    // A host, not the whole URL: the path carries no diagnostic value, and
+    // the host is what a proxy allow-list rule is written against.
     assert.ok(
-      !logs.includes("proactive_refresh_check"),
-      `Timer must not enter the refresh path when disabled. Log: ${logs}`,
-    )
-    assert.ok(
-      !logs.includes("refresh_needed"),
-      `Timer must not initiate an OAuth refresh when disabled. Log: ${logs}`,
-    )
-    assert.ok(
-      logs.includes("sync_auth_json"),
-      `auth.json must still be synced when the refresh half is disabled. ` +
-        `Log: ${logs}`,
+      !String(entry.oauthTokenHost).includes("/"),
+      `Expected a bare host, got ${JSON.stringify(entry.oauthTokenHost)}`,
     )
   })
 
-  it("disabling proactive refresh leaves the reactive 60s refresh untouched", async () => {
+  it("plugin init defers the refresh instead of running `claude` before the UI exists", async () => {
+    // Init is awaited before OpenCode has a UI, and the refresh is a blocking
+    // execSync. On a network where the CLI is the only working refresh path an
+    // expired stored token at startup is the normal case, so a run here would
+    // stall every launch. The first real request owns it instead.
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME
     const originalDebug = process.env.CLAUDE_AUTH_DEBUG
-    const originalProactive = process.env[PROACTIVE_ENV]
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
     const debugLogPath = join(tempHome, "debug.log")
     process.env.HOME = tempHome
     process.env.CLAUDE_AUTH_DEBUG = debugLogPath
-    process.env[PROACTIVE_ENV] = "0"
     globalThis.setInterval = (() => ({
       unref() {},
     })) as unknown as typeof setInterval
 
     try {
       const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
-        // Active account (accounts[0]) sits inside the reactive 60s window,
-        // which the timer never looks at — only getCachedCredentials() does.
+        // Inside the 60s window, so the reactive path would normally refresh.
         aExpiresAt: Date.now() + 30_000,
-        // Kept refreshable so the fallback yields usable creds and init does
-        // not print the "run `claude`" warning over the test output.
         bExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
         bRefreshResult: "success",
       })
 
-      // Plugin init resolves credentials through the reactive path.
       await helpersModule.default({} as never)
 
       const logs = await readFile(debugLogPath, "utf-8")
       assert.ok(
-        logs.includes("refresh_needed"),
-        `Reactive refresh must still fire for a token 30s from expiry with ` +
-          `proactive refresh disabled. Log: ${logs}`,
+        logs.includes("refresh_cli_skipped"),
+        `Init must decline the CLI refresh. Log: ${logs}`,
+      )
+      assert.ok(
+        !logs.includes("refresh_started"),
+        `Init must not spawn \`claude\`. Log: ${logs}`,
       )
     } finally {
       globalThis.setInterval = originalSetInterval
       restoreEnv("HOME", originalHome)
       restoreEnv("CLAUDE_AUTH_DEBUG", originalDebug)
-      restoreEnv(PROACTIVE_ENV, originalProactive)
     }
   })
 
@@ -1441,23 +1304,22 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     let oauthCalls = 0
 
     try {
-      const { helpersModule } = await loadHelpersWithCountingKeychain(
-        Date.now() + 10 * 60_000,
-      )
+      const { helpersModule, keychainModule, childProcessModule } =
+        await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000)
 
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        const url = typeof input === "string" ? input : String(input)
-        if (url.includes("/oauth/token")) {
-          oauthCalls += 1
-          return new Response(
-            JSON.stringify({
-              access_token: "recovered-token",
-              refresh_token: "rt-recovered",
-              expires_in: 36_000,
-            }),
-            { status: 200 },
-          )
-        }
+      // The refresh is a `claude` run now, not an in-process OAuth call. Act
+      // out what a real run does: rotate the store.
+      childProcessModule.__setExecSyncImpl(() => {
+        oauthCalls += 1
+        keychainModule.__setCredentials({
+          accessToken: "recovered-token",
+          refreshToken: "rt-recovered",
+          expiresAt: Date.now() + 36_000_000,
+        })
+        return ""
+      })
+
+      globalThis.fetch = (async () => {
         apiCalls += 1
         return apiCalls === 1
           ? new Response('{"error":"expired"}', { status: 401 })
@@ -1485,7 +1347,11 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       )
 
       assert.equal(response.status, 200)
-      assert.equal(oauthCalls, 1, "the unchanged token must force a refresh")
+      assert.equal(
+        oauthCalls,
+        1,
+        "the unchanged token must force a `claude` run",
+      )
       assert.equal(apiCalls, 2, "the refreshed token must be retried once")
     } finally {
       Date.now = originalNow
@@ -1589,22 +1455,21 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     let oauthCalls = 0
 
     try {
-      const { helpersModule, keychainModule } =
+      const { helpersModule, keychainModule, childProcessModule } =
         await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000)
 
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        const url = typeof input === "string" ? input : String(input)
-        if (url.includes("/oauth/token")) {
-          oauthCalls += 1
-          return new Response(
-            JSON.stringify({
-              access_token: "second-stage-token",
-              refresh_token: "rt-second-stage",
-              expires_in: 36_000,
-            }),
-            { status: 200 },
-          )
-        }
+      // Stage two of recovery is a `claude` run, not an in-process OAuth call.
+      childProcessModule.__setExecSyncImpl(() => {
+        oauthCalls += 1
+        keychainModule.__setCredentials({
+          accessToken: "second-stage-token",
+          refreshToken: "rt-second-stage",
+          expiresAt: Date.now() + 36_000_000,
+        })
+        return ""
+      })
+
+      globalThis.fetch = (async () => {
         apiCalls += 1
         // Calls 1 and 2 are rejected; only the force-refreshed token works.
         return apiCalls <= 2
@@ -1671,19 +1536,18 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     const errorBody = '{"name":"mcp_ReloadFailure"}'
 
     try {
-      const { helpersModule } = await loadHelpersWithCountingKeychain(
-        Date.now() + 10 * 60_000,
-        { throwOnReload: true },
-      )
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        const url = typeof input === "string" ? input : String(input)
-        // A thrown reload leaves no candidate, so the loop falls through to
-        // the force refresh. Rejecting it here is what makes recovery
-        // terminal and surfaces the original 401 untouched.
-        if (url.includes("/oauth/token")) {
-          oauthCalls += 1
-          return new Response('{"error":"invalid_grant"}', { status: 401 })
-        }
+      const { helpersModule, childProcessModule } =
+        await loadHelpersWithCountingKeychain(Date.now() + 10 * 60_000, {
+          throwOnReload: true,
+        })
+      // A thrown reload leaves no candidate, so the loop falls through to the
+      // force refresh — a `claude` run. Letting it rotate nothing is what makes
+      // recovery terminal and surfaces the original 401 untouched.
+      childProcessModule.__setExecSyncImpl(() => {
+        oauthCalls += 1
+        return ""
+      })
+      globalThis.fetch = (async () => {
         apiCalls += 1
         return new Response(errorBody, {
           status: 401,
@@ -1722,7 +1586,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       assert.equal(response.headers.get("x-request-id"), "request-401")
       assert.equal(await response.text(), errorBody)
       assert.equal(apiCalls, 1, "no retry once recovery cannot progress")
-      assert.equal(oauthCalls, 1, "a thrown reload still forces a refresh")
+      assert.equal(oauthCalls, 1, "a thrown reload still forces a `claude` run")
     } finally {
       Date.now = originalNow
       globalThis.setInterval = originalSetInterval

@@ -5,13 +5,28 @@ import {
   rmSync,
   existsSync,
   readdirSync,
+  readFileSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { Writable } from "node:stream"
 import { acquireRefreshLock } from "./refresh-lock.ts"
+import { closeLogger, initLogger } from "./logger.ts"
 
 const SRC = "Claude Code-credentials"
+
+/** The lock file names currently present, whatever their hashed source. */
+function lockFiles(dir: string): string[] {
+  return readdirSync(dir).filter((f) => f.endsWith(".lock"))
+}
+
+/** Path of the single lock file expected to exist right now. */
+function soleLockPath(dir: string): string {
+  const files = lockFiles(dir)
+  assert.equal(files.length, 1, "expected exactly one lock file")
+  return join(dir, files[0]!)
+}
 
 describe("refresh-lock", () => {
   let dir: string
@@ -86,6 +101,140 @@ describe("refresh-lock", () => {
       0,
       "the lock file is removed on release",
     )
+  })
+
+  it("removes its own lock file on release and lets the next caller in", () => {
+    const first = acquireRefreshLock(SRC, { dir })
+    assert.ok(first)
+    assert.equal(lockFiles(dir).length, 1, "a lock file exists while held")
+
+    first!.release()
+    assert.equal(
+      lockFiles(dir).length,
+      0,
+      "an owned lock file is still removed on release",
+    )
+
+    const second = acquireRefreshLock(SRC, { dir })
+    assert.ok(second, "the lock is acquirable again after a normal release")
+    second!.release()
+  })
+
+  it("does not delete a successor's lock file when its hold outran the TTL", () => {
+    // The 2.2.3 CLI fallback runs inside this lock, and execSync freezes the
+    // event loop, so a hold can outlive the TTL with no way to heartbeat. The
+    // holder must not take the successor's lock down with it when it finally
+    // returns.
+    const held = acquireRefreshLock(SRC, { dir, ttlMs: 200 })
+    assert.ok(held)
+
+    const takeover = acquireRefreshLock(SRC, {
+      dir,
+      ttlMs: 200,
+      now: () => Date.now() + 210,
+    })
+    assert.ok(takeover, "a sibling takes the lock over once it looks stale")
+    const successorPayload = readFileSync(soleLockPath(dir), "utf-8")
+
+    held!.release()
+
+    assert.equal(
+      readFileSync(soleLockPath(dir), "utf-8"),
+      successorPayload,
+      "the successor's lock file survives the overrunning holder's release",
+    )
+    assert.equal(
+      acquireRefreshLock(SRC, { dir, ttlMs: 200 }),
+      null,
+      "no third refresher gets in on top of the live successor",
+    )
+    takeover!.release()
+  })
+
+  it("leaves a lock file owned by another process alone on release", () => {
+    const lock = acquireRefreshLock(SRC, { dir })
+    assert.ok(lock)
+    const path = soleLockPath(dir)
+    // What a real cross-process takeover leaves behind: same path, a payload
+    // written by a different pid.
+    const foreign = JSON.stringify({ pid: process.pid + 1, ts: Date.now() })
+    writeFileSync(path, foreign)
+
+    lock!.release()
+
+    assert.equal(
+      readFileSync(path, "utf-8"),
+      foreign,
+      "another process's lock file is left untouched",
+    )
+  })
+
+  it("reports an overrun release so the hold that ran long is visible", () => {
+    const lines: string[] = []
+    initLogger({
+      stream: new Writable({
+        write(chunk, _enc, cb) {
+          lines.push(chunk.toString())
+          cb()
+        },
+      }),
+    })
+    try {
+      const held = acquireRefreshLock(SRC, { dir, ttlMs: 200 })
+      assert.ok(held)
+      const takeover = acquireRefreshLock(SRC, {
+        dir,
+        ttlMs: 200,
+        now: () => Date.now() + 210,
+      })
+      assert.ok(takeover)
+
+      held!.release()
+
+      const entry = lines
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .find((e) => e.event === "refresh_lock_overrun")
+      assert.ok(entry, "expected a refresh_lock_overrun log line")
+      assert.equal(entry.source, SRC)
+      assert.equal(entry.reason, "foreign")
+      assert.equal(entry.ttlMs, 200, "the TTL that was overrun is named")
+      takeover!.release()
+    } finally {
+      closeLogger()
+    }
+  })
+
+  it("does not throw when its lock file was deleted out from under it", () => {
+    const lock = acquireRefreshLock(SRC, { dir })
+    assert.ok(lock)
+    rmSync(soleLockPath(dir))
+
+    assert.doesNotThrow(() => lock!.release())
+    assert.equal(lockFiles(dir).length, 0)
+  })
+
+  it("does not throw or unlink when the lock payload is unparseable", () => {
+    const lock = acquireRefreshLock(SRC, { dir })
+    assert.ok(lock)
+    const path = soleLockPath(dir)
+    writeFileSync(path, "{ not json")
+
+    assert.doesNotThrow(() => lock!.release())
+    assert.equal(
+      readFileSync(path, "utf-8"),
+      "{ not json",
+      "an unprovable lock is left for the TTL takeover, not deleted",
+    )
+  })
+
+  it("tolerates being released twice", () => {
+    const lock = acquireRefreshLock(SRC, { dir })
+    assert.ok(lock)
+    lock!.release()
+    assert.doesNotThrow(() => lock!.release())
+    const next = acquireRefreshLock(SRC, { dir })
+    assert.ok(next, "a double release does not wedge the lock")
+    next!.release()
   })
 
   it("degrades to best-effort (grants) when the lock dir is unusable", () => {

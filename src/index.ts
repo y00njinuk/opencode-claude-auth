@@ -18,20 +18,17 @@ import {
   transformResponseStream,
 } from "./transforms.ts"
 import {
+  OAUTH_TOKEN_URL,
   getCachedCredentials,
   getCredentialsForSync,
-  getCredentialsWithBackoff,
-  getActiveRefreshFailureKind,
   reloadCredentialsFromSource,
   forceRefreshActiveAccount,
-  getActiveAccount,
   syncAuthJson,
   initAccounts,
   setActiveAccountSource,
   loadPersistedAccountSource,
   saveAccountSource,
   refreshAccountsList,
-  refreshIfNeeded,
   type ClaudeCredentials,
 } from "./credentials.ts"
 
@@ -171,38 +168,19 @@ export function buildRequestHeaders(
 
 const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
 
-// Proactive background refresh is OFF by default, which restores the 2.0.0
-// token policy: the 5-minute timer only mirrors already-valid credentials
-// into auth.json and never initiates an OAuth refresh of its own.
-//
-// The 1-hour window shipped in 2.1.4 made the timer exchange the refresh
-// token on every tick for the entire hour before expiry. Each exchange
-// rotates the refresh token server-side, so any tick whose write-back loses
-// (a concurrent `claude` rotation, or a keychain ACL that permits read but
-// not write) leaves the store holding the pre-refresh blob — still valid for
-// the rest of that hour, so refreshIfNeeded's validated re-read adopts it
-// straight back and the next tick repeats the whole exchange. Sustained
-// indefinitely, that drives the token endpoint to 429, which surfaced as
-// three misleading messages: "credentials are expired and could not be
-// refreshed" at init, "Proactive token refresh failed" from the timer, and a
-// rate-limit 429 on the request path — none of which meant the stored
-// credentials were actually bad.
-const DEFAULT_PROACTIVE_REFRESH_THRESHOLD_MS = 0
-
 /**
- * How far ahead of expiry the background sync timer refreshes the token.
- * `0` (the default) disables proactive refresh entirely: the timer then only
- * syncs auth.json from already-valid cached credentials and the reactive
- * (60s) request path does all the refreshing. Set a positive value to opt
- * back into the 2.1.4 background refresh. Invalid or negative values fall
- * back to the default.
+ * Host of the OAuth token endpoint, derived from the URL the refresh path
+ * actually dials instead of being spelled out again here, so this diagnostic
+ * cannot drift into naming a host we stopped talking to. The fallback keeps a
+ * malformed URL from taking the whole plugin down at import time: a diagnostic
+ * must never be the reason the plugin fails to load.
  */
-const PROACTIVE_REFRESH_THRESHOLD_MS = (() => {
-  const raw = process.env.OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS
-  const parsed = raw ? Number.parseInt(raw, 10) : NaN
-  return Number.isFinite(parsed) && parsed >= 0
-    ? parsed
-    : DEFAULT_PROACTIVE_REFRESH_THRESHOLD_MS
+const OAUTH_TOKEN_HOST = (() => {
+  try {
+    return new URL(OAUTH_TOKEN_URL).host
+  } catch {
+    return OAUTH_TOKEN_URL
+  }
 })()
 
 const plugin: Plugin = async () => {
@@ -239,78 +217,66 @@ const plugin: Plugin = async () => {
       activeSource: defaultAccount.source,
     })
 
-    const initialCreds = await getCachedCredentials()
+    // The failure class this exists to make visible is "the plugin's own
+    // in-process fetch cannot reach the OAuth token host, while the `claude`
+    // CLI — a separate Node process with its own proxy and CA handling — can".
+    // A corporate proxy that blocks or MITM-intercepts claude.ai while letting
+    // api.anthropic.com through produces exactly that, and from inside the
+    // failure it is indistinguishable from a dead refresh token. Nothing else
+    // in the log records the environment that decides it, so record it here.
+    //
+    // PRESENCE ONLY — never the values. A proxy URL routinely carries
+    // credentials (http://user:password@proxy.corp:8080), and NO_PROXY /
+    // NODE_EXTRA_CA_CERTS leak internal hostnames and filesystem layout. None
+    // of that is needed to answer the only question this entry is asked: "is a
+    // proxy or a custom trust store in play at all?". `Boolean` also reads an
+    // empty value as absent, matching how Node itself treats an empty proxy
+    // variable. Never widen these to the actual strings — a debug log is
+    // something users paste into issue reports.
+    //
+    // Deliberately a log() and not a console.warn(): a configured proxy is not
+    // a problem to nag the user about, it is a fact a maintainer needs in hand
+    // when a refresh fails.
+    log("plugin_init_network_env", {
+      oauthTokenHost: OAUTH_TOKEN_HOST,
+      HTTPS_PROXY: Boolean(process.env.HTTPS_PROXY),
+      https_proxy: Boolean(process.env.https_proxy),
+      HTTP_PROXY: Boolean(process.env.HTTP_PROXY),
+      http_proxy: Boolean(process.env.http_proxy),
+      NO_PROXY: Boolean(process.env.NO_PROXY),
+      no_proxy: Boolean(process.env.no_proxy),
+      NODE_EXTRA_CA_CERTS: Boolean(process.env.NODE_EXTRA_CA_CERTS),
+      NODE_TLS_REJECT_UNAUTHORIZED: Boolean(
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED,
+      ),
+    })
+
+    // allowCliRefresh: false — this call is awaited before OpenCode has a UI,
+    // so letting it run `claude` stalls the launch itself rather than one
+    // request, and on a network where the CLI is the only working refresh path
+    // an expired stored token at startup is the normal case. A null result is
+    // not an error here: the first request refreshes, with a UI up to show for
+    // it. Nothing is warned about, because nothing is known to be wrong — the
+    // stored refresh token outlives its access token by weeks, so an expired
+    // access token says nothing about whether the account is healthy.
+    const initialCreds = await getCachedCredentials({ allowCliRefresh: false })
     if (initialCreds) {
       syncAuthJson(initialCreds)
-    } else if (getActiveRefreshFailureKind() === "transient") {
-      // A rate-limited / 5xx / network-blip refresh says nothing about
-      // whether the stored credentials are still good — the refresh token
-      // outlives its access token by weeks. Telling the user to re-run
-      // `claude` here sends them to fix an account that is not broken, so
-      // leave it to the request path, which waits the cooldown out and
-      // reports a retryable 429 if it still cannot get a token.
-      log("plugin_init_refresh_transient", {
-        source: defaultAccount.source,
-      })
     } else {
-      console.warn(
-        "opencode-claude-auth: Claude credentials are expired and could not be refreshed. Run `claude` to re-authenticate.",
-      )
+      log("plugin_init_refresh_deferred", { source: defaultAccount.source })
     }
 
-    // Keep auth.json synced and proactively refresh before expiry.
-    // refreshIfNeeded() always resolves the currently ACTIVE account
-    // (via getActiveAccount() internally) — not a closure-captured account
-    // list — so this stays correct across account switches. Passing
-    // PROACTIVE_REFRESH_THRESHOLD_MS (1 hour by default) means it triggers
-    // a real OAuth refresh once the token is within that window of expiry,
-    // and simply returns the untouched credentials otherwise (no-op
-    // refresh). This prevents the "run `claude` to re-authenticate" message
-    // from appearing mid-session when the token silently expires.
-    // OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS tunes that window, or
-    // disables the refresh half of this timer entirely when set to 0.
-    let proactiveRefreshWarned = false
-    const syncTimer = setInterval(async () => {
+    // Mirror-only, by design. The timer keeps auth.json in step with
+    // credentials that are already valid and never refreshes: refreshing here
+    // would mean running `claude` on a 5-minute schedule, which bills a
+    // request and freezes the process for every tick of a window the request
+    // path already covers. 2.1.4 shipped a refreshing timer and it is what
+    // drove the token endpoint to 429; the request path's 60s window is the
+    // only place a refresh belongs.
+    const syncTimer = setInterval(() => {
       try {
-        // Proactive refresh disabled: sync auth.json from cached
-        // credentials only, never initiate an OAuth refresh from the timer.
-        if (PROACTIVE_REFRESH_THRESHOLD_MS === 0) {
-          const cached = getCredentialsForSync()
-          if (cached) syncAuthJson(cached)
-          return
-        }
-
-        const account = getActiveAccount()
-        log("proactive_refresh_check", {
-          source: account?.source ?? null,
-          expiresAt: account?.credentials?.expiresAt ?? null,
-          thresholdMs: PROACTIVE_REFRESH_THRESHOLD_MS,
-        })
-
-        const creds = await refreshIfNeeded(
-          undefined,
-          PROACTIVE_REFRESH_THRESHOLD_MS,
-        )
-        if (creds) {
-          syncAuthJson(creds)
-          if (proactiveRefreshWarned) {
-            log("proactive_refresh_recovered", { source: account?.source })
-          }
-          proactiveRefreshWarned = false
-        } else {
-          const kind = getActiveRefreshFailureKind()
-          log("proactive_refresh_failed", { source: account?.source, kind })
-          // Same reasoning as the init path: a transient failure leaves the
-          // refresh token usable, and a background tick failing is not a
-          // reason to send the user to re-authenticate. Only warn once per
-          // outage, and only when the refresh token itself is dead.
-          if (!proactiveRefreshWarned && kind !== "transient") {
-            proactiveRefreshWarned = true
-            console.warn(
-              "opencode-claude-auth: Proactive token refresh failed. Run `claude` to re-authenticate.",
-            )
-          }
-        }
+        const cached = getCredentialsForSync()
+        if (cached) syncAuthJson(cached)
       } catch {
         // Non-fatal
       }
@@ -366,45 +332,20 @@ const plugin: Plugin = async () => {
           baseURL: "https://api.anthropic.com/v1",
           async fetch(input: RequestInfo | URL, init?: RequestInit) {
             const requestInit = init ?? {}
-            let latest = await getCachedCredentials()
+            const latest = await getCachedCredentials()
             if (!latest) {
-              // A transient refresh rate-limit must not surface as a hard error.
-              // Wait (bounded, abort-aware) for our cooldown to clear or for a
-              // sibling OpenCode instance / the claude CLI to write a fresh
-              // token to the shared store.
-              latest = await getCredentialsWithBackoff({
-                signal: requestInit.signal ?? undefined,
-              })
-            }
-            if (!latest) {
-              if (getActiveRefreshFailureKind() === "transient") {
-                // Retryable: let OpenCode/the AI SDK back off and retry rather
-                // than telling the user to re-authenticate for a passing
-                // rate-limit that the refresh token would otherwise survive.
-                log("fetch_credentials_transient_exhausted", {
-                  modelId: "unknown",
-                })
-                return new Response(
-                  JSON.stringify({
-                    type: "error",
-                    error: {
-                      type: "overloaded_error",
-                      message:
-                        "Claude token refresh is rate-limited; retry shortly.",
-                    },
-                  }),
-                  {
-                    status: 429,
-                    headers: {
-                      "content-type": "application/json",
-                      "retry-after": "5",
-                    },
-                  },
-                )
-              }
+              // No credentials and `claude` could not produce any. There is
+              // nothing to wait for and nothing to classify: the CLI owns the
+              // refresh, so if it could not repair the account, only the user
+              // can. Say so plainly and name the CLI cooldown, which is the one
+              // reason a retry a few seconds from now would be refused without
+              // even trying.
               log("fetch_no_credentials", { modelId: "unknown" })
               throw new Error(
-                "Claude Code credentials are unavailable or expired. Run `claude` to refresh them.",
+                "Claude Code credentials are unavailable and `claude` could not refresh them. " +
+                  `Check that the \`claude\` CLI runs on this machine (it reaches ${OAUTH_TOKEN_HOST} to refresh, ` +
+                  "which api.anthropic.com access does not imply), then run `claude` to re-authenticate. " +
+                  "Set CLAUDE_AUTH_DEBUG=1 for the refresh log.",
               )
             }
 
