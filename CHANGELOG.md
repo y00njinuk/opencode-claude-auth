@@ -4,6 +4,103 @@ Releases from 2.2.0 onward are this fork (`@y00njinuk/opencode-claude-auth`).
 Earlier entries are inherited from upstream `opencode-claude-auth` and their
 links point at the upstream repository.
 
+## [2.2.3](https://github.com/y00njinuk/opencode-claude-auth/compare/v2.2.1...v2.2.3) (2026-08-24)
+
+
+### Bug Fixes
+
+* refresh tokens by running the `claude` CLI instead of calling the OAuth token endpoint in-process, restoring the 2.0.0 policy ([65141f4](https://github.com/y00njinuk/opencode-claude-auth/commit/65141f4))
+* stop persisting refreshed credentials, removing the failure where a lost write-back left the account unrecoverable ([65141f4](https://github.com/y00njinuk/opencode-claude-auth/commit/65141f4))
+* stop the background timer refreshing at all; it mirrors already-valid credentials into `auth.json` and nothing more ([65141f4](https://github.com/y00njinuk/opencode-claude-auth/commit/65141f4))
+* keep `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` out of the `claude` child environment ([65141f4](https://github.com/y00njinuk/opencode-claude-auth/commit/65141f4))
+* bound the `claude` run with a per-account cooldown, which 2.0.0 lacked ([65141f4](https://github.com/y00njinuk/opencode-claude-auth/commit/65141f4))
+* size the cross-process refresh lock to the blocking hold, and stop a released lock deleting a successor's lock file ([65141f4](https://github.com/y00njinuk/opencode-claude-auth/commit/65141f4))
+* record proxy/TLS environment presence and the refresh host at init in the debug log (presence booleans only, never values) ([65141f4](https://github.com/y00njinuk/opencode-claude-auth/commit/65141f4))
+
+
+### The plugin no longer refreshes tokens itself
+
+`https://claude.ai/v1/oauth/token` is a consumer host. Corporate networks
+routinely block or TLS-intercept it while allowing `api.anthropic.com`, so
+the single request an in-process refresh needs fails on a connection where
+every actual API request succeeds. OpenCode is a Bun single-file binary;
+the `claude` CLI is a separate Node process with its own proxy, CA and DNS
+handling, and it works on exactly the networks where the in-process `fetch`
+does not.
+
+2.0.0 was immune to this by accident: its refresh ran in a subprocess
+spawned as `process.execPath -e`, which inside OpenCode's compiled binary is
+not a JavaScript runtime, so the refresh always failed and every refresh
+fell through to `claude -p . --model haiku`. 2.1.5 replaced that with a
+working in-process refresh; 2.1.6 then had to classify endpoint failures as
+transient or terminal, back off per account, and wait requests out through
+cooldowns — and classified every network-layer failure as a passing rate
+limit, so a blocked network looped forever reporting a limit that was never
+there.
+
+This release deletes that machinery rather than fixing it. `refresh-backoff.ts`
+is gone, along with transient/terminal classification, per-account endpoint
+backoff, the request-path wait loop, and borrowed-account fallback.
+`credentials.ts` drops from roughly 2000 lines to under 600. The policy is
+now the whole of it: pick up anything another process already wrote, and if
+the token is genuinely at the end of its life, run `claude` and read the
+store again.
+
+**The refresh token can no longer be lost by this plugin.** A refresh
+rotates the refresh token server-side, so whoever performs it must persist
+the result or the account is dead. When the plugin refreshed, a failed
+write-back — a keychain ACL, a compare-and-swap mismatch — silently stranded
+the rotated token in memory while the store kept one the server had already
+invalidated, recoverable only by an interactive re-login. The CLI rotates
+and persists in one step, as the owner of that store. This plugin now never
+writes credentials.
+
+**What it costs.** A refresh is a `claude -p . --model haiku` run: one small
+billed request, and a blocking `execSync` that freezes OpenCode for its
+duration (~5s on a healthy network). Access tokens last 8-10 hours, so this
+happens a handful of times a day. 2.0.0 paid the same price with no bound at
+all — a failed resolution drops the account cache, so an account the CLI
+could not repair paid two 60s freezes on *every* request, forever. A
+per-account cooldown (`OPENCODE_CLAUDE_AUTH_CLI_COOLDOWN_MS`, 60s) now bounds
+that, and plugin init declines the run outright so a launch is never stalled
+behind it.
+
+Unchanged: model support, beta-flag negotiation and long-context retry,
+request/response transforms, billing headers, multi-account switching, and
+401 recovery. `betas.ts`, `model-config.ts`, `transforms.ts`, `signing.ts`,
+`keychain.ts` and `http.ts` are byte-identical to 2.2.1, and no line of the
+model or request-shaping path in `index.ts` changed.
+
+
+### Removed environment variables
+
+`OPENCODE_CLAUDE_AUTH_PROACTIVE_REFRESH_MS`,
+`OPENCODE_CLAUDE_AUTH_REFRESH_WAIT_MS`,
+`OPENCODE_CLAUDE_AUTH_REFRESH_COOLDOWN_MS` and
+`OPENCODE_CLAUDE_AUTH_MAX_RETRY_AFTER_MS` are gone: every one of them
+configured the in-process OAuth refresh or the backoff around it, and there
+is no longer anything for them to configure. Setting them is now inert
+rather than an error.
+
+`OPENCODE_CLAUDE_AUTH_CLI_TIMEOUT_MS` (60s) and
+`OPENCODE_CLAUDE_AUTH_CLI_COOLDOWN_MS` (60s) replace them, and are the only
+two knobs the refresh path has.
+
+Removing documented variables would normally argue for a minor version.
+2.2.3 was chosen deliberately by the maintainer, who is the package's
+primary consumer.
+
+
+### Why there is no 2.2.2
+
+2.2.2 carried request-path diagnostics for the in-process refresh and was
+cut and then backed out at the maintainer's request, restoring 2.2.1
+exactly. The version number is retired rather than reused. Those
+diagnostics described failures of a refresh path that no longer exists, so
+they are not re-landed; the debug log's `refresh_started` /
+`refresh_adopted_from_cli` / `refresh_exhausted` events cover the CLI path
+instead.
+
 ## [2.2.1](https://github.com/y00njinuk/opencode-claude-auth/compare/v2.2.0...v2.2.1) (2026-08-22)
 
 
