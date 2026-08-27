@@ -154,11 +154,11 @@ All configurable parameters can be overridden via environment variables. If Anth
 | `ANTHROPIC_BETA_FLAGS`                     | Comma-separated beta feature flags                                                                                                                                                                                                                                                           | `baseBetas` list in [`src/model-config.ts`](src/model-config.ts)   |
 | `CLAUDE_CODE_ENTRYPOINT`                   | Entrypoint reported in the billing header. Set by Claude Code itself; an inherited value changes what the plugin sends, which is why this repo's tests run under `env -u CLAUDE_CODE_ENTRYPOINT`.                                                                                            | `sdk-cli`                                                          |
 | `CLAUDE_AUTH_DEBUG`                        | Enable diagnostic logging (`1` for default path, or a custom file path)                                                                                                                                                                                                                      | disabled                                                           |
-| `CLAUDE_CONFIG_DIR`                        | Claude Code config directory used for the credentials-file fallback (reads `$CLAUDE_CONFIG_DIR/.credentials.json`). macOS still checks the Keychain first.                                                                                                                                   | `~/.claude`                                                        |
+| `CLAUDE_CONFIG_DIR`                        | Claude Code config directory used for the credentials-file fallback (reads `$CLAUDE_CONFIG_DIR/.credentials.json`). macOS still checks the Keychain first. Point it at a shared path to reuse one credential file across environments — see [여러 WSL 환경에서 자격증명 공유](#여러-wsl-환경에서-자격증명-공유).                                                              | `~/.claude`                                                        |
 | `OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS`        | Max ms the plugin waits when honouring a 429/529 `retry-after` header. Beyond this cap the response surfaces immediately so OpenCode doesn't appear to hang on hour-long quota resets.                                                                                                       | `30000`                                                            |
 | `OPENCODE_CLAUDE_AUTH_TOOL_REPAIR`         | Strategy for reconciling `tool_use`/`tool_result` adjacency broken by OpenCode auto-compaction. `placeholder` synthesizes a paired result for orphaned `tool_use` blocks (lossless, preserves `thinking` blocks); `drop` removes orphaned blocks (omitting whole thinking turns).            | `placeholder`                                                      |
 | `OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_TTL_MS` | TTL for the cross-process refresh lock. A held lock older than this is treated as stale (crashed holder) and taken over.                                                                                                                                                                     | `20000`                                                            |
-| `OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_DIR`    | Directory for the advisory cross-process refresh lock files.                                                                                                                                                                                                                                 | OpenCode data dir (`~/.local/share/opencode`)                      |
+| `OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_DIR`    | Directory for the advisory cross-process refresh lock files. When several environments share one credential file, put this on the shared path too so the lock spans them — see [여러 WSL 환경에서 자격증명 공유](#여러-wsl-환경에서-자격증명-공유).                                                                                                                          | OpenCode data dir (`~/.local/share/opencode`)                      |
 | `OPENCODE_CLAUDE_AUTH_CLI_TIMEOUT_MS`      | Per-attempt budget for the `claude` run that performs a refresh. Two attempts are made. Note this is a `SIGTERM` deadline, not a hard one. Invalid, zero or negative values use the default.                                                                                                 | `60000`                                                            |
 | `OPENCODE_CLAUDE_AUTH_CLI_COOLDOWN_MS`     | How long a `claude` run that rotated nothing suppresses the next one for the same account. The run is a blocking `execSync` that freezes OpenCode for its duration, so this bounds the cost when the CLI cannot repair the account either. Invalid, zero or negative values use the default. | `60000`                                                            |
 
@@ -209,6 +209,33 @@ export ANTHROPIC_CLI_VERSION=2.2.0
 
 이 정책을 코드에서 강제하기 위한 규약과 불변 조건은 [`CLAUDE.md`](CLAUDE.md)에 있다.
 갱신 경로를 수정하기 전에 반드시 읽어야 한다.
+
+### 여러 WSL 환경에서 자격증명 공유
+
+플러그인은 자격증명을 읽기만 하므로, 여러 WSL 배포판이 `.credentials.json` 하나를
+공유하는 구성이 가능하다. 각 배포판에서 두 변수를 같은 공유 경로로 지정한다:
+
+```bash
+# 모든 배포판에서 보이는 경로 (예: Windows 드라이브 마운트)
+export CLAUDE_CONFIG_DIR=/mnt/c/Users/<이름>/.claude-shared
+# 갱신 락도 공유 경로에 두어 배포판 간 동시 `claude` 실행을 막는다
+export OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_DIR=$CLAUDE_CONFIG_DIR
+```
+
+- 플러그인의 읽기와 CLI의 갱신 쓰기가 모두 `$CLAUDE_CONFIG_DIR/.credentials.json`
+  한 파일로 수렴한다. 갱신을 위한 `claude` 실행에도 같은 `CLAUDE_CONFIG_DIR`가
+  전달되므로, 회전된 토큰은 공유 파일에 저장되고 나머지 배포판은 읽기만 한다.
+- `OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_DIR`를 옮기지 않으면 락 파일이 배포판별
+  경로(`~/.local/share/opencode`)에 생겨 배포판 **간**에는 효력이 없다. 두 배포판이
+  같은 만료 창에서 동시에 `claude`를 실행하면 refresh token이 이중 회전할 수 있다.
+- 락을 못 잡은 쪽은 `claude`를 실행하지 않고, 다음 요청에서 락 홀더가 써 놓은
+  토큰을 읽어 채택한다. 기다리거나 중복 실행하지 않는다.
+- 두 변수는 OpenCode 프로세스가 상속해야 하므로 셸 rc(`~/.bashrc` 등)에 넣는다.
+- `/mnt/c`의 기본 마운트는 chmod를 무시하므로 `.credentials.json`이 0600으로
+  유지되지 않는다. 동작에는 지장이 없으나, 권한을 지키려면 각 배포판의
+  `/etc/wsl.conf`에 `[automount] options = "metadata"`를 켜고 `wsl --shutdown`으로
+  재시작한다.
+- `/mnt/wsl`은 tmpfs라 재부팅 시 사라지므로 공유 경로로 쓰지 않는다.
 
 ## Disclaimer
 
